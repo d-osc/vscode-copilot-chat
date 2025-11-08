@@ -8,4 +8,5 @@ import './geminiPrompts';
 import './openAIPrompts';
 import './vscModelPrompts';
 import './xAIPrompts';
+import './zAIPrompts';
 

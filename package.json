@@ -2,7 +2,7 @@
 	"name": "copilot-chat",
 	"displayName": "GitHub Copilot Chat",
 	"description": "AI chat features powered by Copilot",
-	"version": "0.34.0",
+	"version": "1.0.0-dev",
 	"build": "1",
 	"internalAIKey": "1058ec22-3c95-4951-8443-f26c1f325911",
 	"completionsCoreVersion": "1.378.1799",
@@ -4478,6 +4478,7 @@
 		"extract-chat-lib": "tsx script/build/extractChatLib.ts",
 		"create_venv": "tsx script/setup/createVenv.mts",
 		"package": "vsce package",
+		"package:dev":"vsce package --allow-package-secrets sendgrid",
 		"web": "vscode-test-web --headless --extensionDevelopmentPath=. .",
 		"test:prompt": "mocha \"src/extension/completions-core/vscode-node/prompt/**/test/**/*.test.{ts,tsx}\"",
 		"test:completions-core": "tsx src/extension/completions-core/vscode-node/extension/test/runTest.ts"

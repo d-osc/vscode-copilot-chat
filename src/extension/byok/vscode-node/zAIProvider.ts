@@ -83,11 +83,18 @@ export class ZAILMProvider implements BYOKModelProvider<LanguageModelChatInforma
 				} else {
 					// Mix in generic capabilities for models we don't know
 					modelList[model.id] = {
-						maxInputTokens: 100000,
-						maxOutputTokens: 16000,
+						maxInputTokens: 200000,
+						maxOutputTokens: 200000,
 						name: model.display_name,
 						toolCalling: true,
-						vision: false
+						vision: true,
+						thinking: this._enableThinking(model.id),
+						editTools: [
+							'find-replace',
+							'multi-find-replace',
+							'apply-patch',
+							'code-rewrite'
+						]
 					};
 				}
 			}

@@ -87,7 +87,14 @@ export class ZAILMProvider implements BYOKModelProvider<LanguageModelChatInforma
 						maxOutputTokens: 300000,
 						name: model.display_name,
 						toolCalling: true,
-						vision: true
+						vision: true,
+						thinking: this._enableThinking(model.id),
+						editTools: [
+							'find-replace',
+							'multi-find-replace',
+							'apply-patch',
+							'code-rewrite'
+						]
 					};
 				}
 			}

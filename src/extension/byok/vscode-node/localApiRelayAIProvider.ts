@@ -13,7 +13,7 @@ import { BaseOpenAICompatibleLMProvider } from './baseOpenAICompatibleProvider';
 import { IBYOKStorageService } from './byokStorageService';
 
 export class LocalApiRelayAIBYOKLMProvider extends BaseOpenAICompatibleLMProvider {
-	public static readonly providerName = 'Local API Relay';
+	public static readonly providerName = 'Local API Relay AI';
 
 	constructor(
 		knownModels: BYOKKnownModels,

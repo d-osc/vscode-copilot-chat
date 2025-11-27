@@ -2,18 +2,17 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-import { ConfigKey, IConfigurationService } from '../../../platform/configuration/common/configurationService';
-import { IChatModelInformation, ModelSupportedEndpoint } from '../../../platform/endpoint/common/endpointProvider';
+import { IConfigurationService } from '../../../platform/configuration/common/configurationService';
 import { ILogService } from '../../../platform/log/common/logService';
 import { IFetcherService } from '../../../platform/networking/common/fetcherService';
 import { IExperimentationService } from '../../../platform/telemetry/common/nullExperimentationService';
 import { IInstantiationService } from '../../../util/vs/platform/instantiation/common/instantiation';
-import { BYOKAuthType, BYOKKnownModels, BYOKModelCapabilities } from '../common/byokProvider';
+import { BYOKAuthType, BYOKKnownModels } from '../common/byokProvider';
 import { BaseOpenAICompatibleLMProvider } from './baseOpenAICompatibleProvider';
 import { IBYOKStorageService } from './byokStorageService';
 
-export class LocalApiRelayAIBYOKLMProvider extends BaseOpenAICompatibleLMProvider {
-	public static readonly providerName = 'Local API Relay AI';
+export class AIRelayAIBYOKLMProvider extends BaseOpenAICompatibleLMProvider {
+	public static readonly providerName = 'AIRelay';
 
 	constructor(
 		knownModels: BYOKKnownModels,
@@ -26,8 +25,8 @@ export class LocalApiRelayAIBYOKLMProvider extends BaseOpenAICompatibleLMProvide
 	) {
 		super(
 			BYOKAuthType.GlobalApiKey,
-			LocalApiRelayAIBYOKLMProvider.providerName,
-			'http://localhost:8647/openai/v1',
+			AIRelayAIBYOKLMProvider.providerName,
+			'http://localhost:8647/copilot/v1',
 			knownModels,
 			byokStorageService,
 			_fetcherService,
@@ -36,16 +35,26 @@ export class LocalApiRelayAIBYOKLMProvider extends BaseOpenAICompatibleLMProvide
 		);
 	}
 
-	protected override async getModelInfo(modelId: string, apiKey: string | undefined, modelCapabilities?: BYOKModelCapabilities): Promise<IChatModelInformation> {
-		const modelInfo = await super.getModelInfo(modelId, apiKey, modelCapabilities);
-		const enableResponsesApi = this._configurationService.getExperimentBasedConfig(ConfigKey.UseResponsesApi, this._expService);
-		if (enableResponsesApi) {
-			modelInfo.supported_endpoints = [
-				ModelSupportedEndpoint.ChatCompletions,
-				ModelSupportedEndpoint.Responses
-			];
+	protected override async getAllModels(): Promise<BYOKKnownModels> {
+		try {
+			const response = await this._fetcherService.fetch('http://localhost:8647/copilot/v1/models', { method: 'GET' });
+			const data: any = await response.json();
+			const knownModels: BYOKKnownModels = {};
+			for (const model of data.data) {
+				knownModels[model.id] = {
+					name: model.name,
+					toolCalling: model.toolCalling,
+					vision: model.vision,
+					maxInputTokens: model.maxInputTokens,
+					maxOutputTokens: model.maxOutputTokens
+				};
+			}
+			this._knownModels = knownModels;
+			return knownModels;
+		} catch (error) {
+			this._logService.error(error, `Error fetching available OpenRouter models`);
+			throw error;
 		}
 
-		return modelInfo;
 	}
 }

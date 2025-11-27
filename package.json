@@ -2,7 +2,7 @@
 	"name": "copilot-chat",
 	"displayName": "GitHub Copilot Chat",
 	"description": "AI chat features powered by Copilot",
-	"version": "1.35.0-dev",
+	"version": "1.35.1-dev",
 	"build": "1",
 	"internalAIKey": "1058ec22-3c95-4951-8443-f26c1f325911",
 	"completionsCoreVersion": "1.378.1799",
@@ -1696,8 +1696,7 @@
 			},
 			{
 				"vendor": "airelay",
-				"displayName": "AIRelay",
-				"managementCommand": "github.copilot.chat.manageBYOK"
+				"displayName": "AIRelay"
 			},
 			{
 				"vendor": "gemini",
@@ -2581,6 +2580,14 @@
 							"preview"
 						],
 						"markdownDescription": "%github.copilot.config.byok.ollamaEndpoint%"
+					},
+					"github.copilot.chat.byok.airRelayEndpoint": {
+						"type": "string",
+						"default": "http://localhost:8637",
+						"tags": [
+							"preview"
+						],
+						"markdownDescription": "%github.copilot.config.byok.airRelayEndpoint%"
 					}
 				}
 			},

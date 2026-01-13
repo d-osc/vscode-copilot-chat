@@ -29,9 +29,8 @@ import { isEncryptedThinkingDelta } from '../../../platform/thinking/common/thin
 import { BaseTokensPerCompletion } from '../../../platform/tokenizer/node/tokenizer';
 import { TelemetryCorrelationId } from '../../../util/common/telemetryCorrelationId';
 import { Emitter } from '../../../util/vs/base/common/event';
-import { Disposable } from '../../../util/vs/base/common/lifecycle';
-import { isDefined, isNumber, isString, isStringArray } from '../../../util/vs/base/common/types';
-import { localize } from '../../../util/vs/nls';
+import { Disposable, MutableDisposable } from '../../../util/vs/base/common/lifecycle';
+import { isBoolean, isDefined, isNumber, isString, isStringArray } from '../../../util/vs/base/common/types';
 import { IInstantiationService } from '../../../util/vs/platform/instantiation/common/instantiation';
 import { ExtensionMode } from '../../../vscodeTypes';
 import type { LMResponsePart } from '../../byok/common/byokProvider';
@@ -43,6 +42,8 @@ import { LanguageModelAccessPrompt } from './languageModelAccessPrompt';
 export class LanguageModelAccess extends Disposable implements IExtensionContribution {
 
 	readonly id = 'languageModelAccess';
+
+	readonly activationBlocker?: Promise<void>;
 
 	private readonly _onDidChange = this._register(new Emitter<void>());
 	private _currentModels: vscode.LanguageModelChatInformation[] = []; // Store current models for reference
@@ -71,8 +72,10 @@ export class LanguageModelAccess extends Disposable implements IExtensionContrib
 		}
 
 		// initial
-		this._registerChatProvider();
-		this._registerEmbeddings();
+		this.activationBlocker = Promise.all([
+			this._registerChatProvider(),
+			this._registerEmbeddings(),
+		]).then(() => { });
 	}
 
 	override dispose(): void {
@@ -83,7 +86,7 @@ export class LanguageModelAccess extends Disposable implements IExtensionContrib
 		return this._currentModels;
 	}
 
-	private _registerChatProvider(): void {
+	private async _registerChatProvider(): Promise<void> {
 		const provider: vscode.LanguageModelChatProvider = {
 			onDidChangeLanguageModelChatInformation: this._onDidChange.event,
 			provideLanguageModelChatInformation: this._provideLanguageModelChatInfo.bind(this),
@@ -105,7 +108,7 @@ export class LanguageModelAccess extends Disposable implements IExtensionContrib
 		}
 
 		const models: vscode.LanguageModelChatInformation[] = [];
-		const chatEndpoints = await this._endpointProvider.getAllChatEndpoints();
+		const chatEndpoints = (await this._endpointProvider.getAllChatEndpoints()).filter(e => e.showInModelPicker || e.model === 'gpt-4o-mini');
 		const autoEndpoint = await this._automodeService.resolveAutoModeEndpoint(undefined, chatEndpoints);
 		chatEndpoints.push(autoEndpoint);
 		let defaultChatEndpoint: IChatEndpoint | undefined;
@@ -113,13 +116,16 @@ export class LanguageModelAccess extends Disposable implements IExtensionContrib
 		if (this._authenticationService.copilotToken?.isNoAuthUser) {
 			// No Auth users always get Auto as the default model
 			defaultChatEndpoint = autoEndpoint;
+		} else if (defaultExpModel === AutoChatEndpoint.pseudoModelId) {
+			// Auto is a fake model id so force map it
+			defaultChatEndpoint = autoEndpoint;
 		} else if (defaultExpModel) {
 			// Find exp default
 			defaultChatEndpoint = chatEndpoints.find(e => e.model === defaultExpModel);
 		}
 		if (!defaultChatEndpoint) {
 			// Find a default set by CAPI
-			defaultChatEndpoint = chatEndpoints.find(e => e.isDefault) ?? await this._endpointProvider.getChatEndpoint('gpt-4.1') ?? chatEndpoints[0];
+			defaultChatEndpoint = chatEndpoints.find(e => e.isDefault) ?? chatEndpoints.find(e => e.showInModelPicker) ?? chatEndpoints[0];
 		}
 		const seenFamilies = new Set<string>();
 
@@ -135,16 +141,16 @@ export class LanguageModelAccess extends Disposable implements IExtensionContrib
 				modelDescription = endpoint.degradationReason;
 			} else if (endpoint instanceof AutoChatEndpoint) {
 				if (this._authenticationService.copilotToken?.isNoAuthUser || (endpoint.discountRange.low === 0 && endpoint.discountRange.high === 0)) {
-					modelDescription = localize('languageModel.autoTooltipNoAuth', 'Auto selects the best model for your request based on capacity and performance.');
+					modelDescription = vscode.l10n.t('Auto selects the best model for your request based on capacity and performance.');
 				} else if (endpoint.discountRange.low === endpoint.discountRange.high) {
-					modelDescription = localize('languageModel.autoTooltipSameDiscount', 'Auto selects the best model for your request based on capacity and performance. Auto is given a {0}% discount.', endpoint.discountRange.low * 100);
+					modelDescription = vscode.l10n.t('Auto selects the best model for your request based on capacity and performance. Auto is given a {0}% discount.', endpoint.discountRange.low * 100);
 				} else {
-					modelDescription = localize('languageModel.autoTooltipDiffDiscount', 'Auto selects the best model for your request based on capacity and performance. Auto is given a {0}% to {1}% discount.', endpoint.discountRange.low * 100, endpoint.discountRange.high * 100);
+					modelDescription = vscode.l10n.t('Auto selects the best model for your request based on capacity and performance. Auto is given a {0}% to {1}% discount.', endpoint.discountRange.low * 100, endpoint.discountRange.high * 100);
 				}
 			} else if (endpoint.multiplier) {
-				modelDescription = localize('languageModel.costTooltip', '{0} ({1}) is counted at a {2}x rate.', sanitizedModelName, endpoint.version, endpoint.multiplier);
+				modelDescription = vscode.l10n.t('{0} ({1}) is counted at a {2}x rate.', sanitizedModelName, endpoint.version, endpoint.multiplier);
 			} else if (endpoint.isFallback && endpoint.multiplier === 0) {
-				modelDescription = localize('languageModel.baseTooltip', '{0} ({1}) does not count towards your premium request limit. This model may be slowed during times of high congestion.', sanitizedModelName, endpoint.version);
+				modelDescription = vscode.l10n.t('{0} ({1}) does not count towards your premium request limit. This model may be slowed during times of high congestion.', sanitizedModelName, endpoint.version);
 			} else {
 				modelDescription = `${sanitizedModelName} (${endpoint.version})`;
 			}
@@ -153,11 +159,11 @@ export class LanguageModelAccess extends Disposable implements IExtensionContrib
 			if (endpoint instanceof AutoChatEndpoint) {
 				modelCategory = { label: '', order: Number.MIN_SAFE_INTEGER };
 			} else if (endpoint.isPremium === undefined || this._authenticationService.copilotToken?.isFreeUser) {
-				modelCategory = { label: localize('languageModelHeader.copilot', "Copilot Models"), order: 0 };
+				modelCategory = { label: vscode.l10n.t("Copilot Models"), order: 0 };
 			} else if (endpoint.isPremium) {
-				modelCategory = { label: localize('languageModelHeader.premium', "Premium Models"), order: 1 };
+				modelCategory = { label: vscode.l10n.t("Premium Models"), order: 1 };
 			} else {
-				modelCategory = { label: localize('languageModelHeader.standard', "Standard Models"), order: 0 };
+				modelCategory = { label: vscode.l10n.t("Standard Models"), order: 0 };
 			}
 
 			// Counting tokens requires instantiating the tokenizers, which makes this process use a lot of memory.
@@ -176,7 +182,7 @@ export class LanguageModelAccess extends Disposable implements IExtensionContrib
 				const customModel = endpoint.customModel;
 				modelDetail = customModel.owner_name;
 				modelDescription = `${endpoint.name} is contributed by ${customModel.owner_name} using ${customModel.key_name}`;
-				modelCategory = { label: localize('languageModelHeader.custom_models', "Custom Models"), order: 2 };
+				modelCategory = { label: vscode.l10n.t("Custom Models"), order: 2 };
 			}
 
 			const session = this._authenticationService.anyGitHubSession;
@@ -226,7 +232,7 @@ export class LanguageModelAccess extends Disposable implements IExtensionContrib
 		options: vscode.ProvideLanguageModelChatResponseOptions,
 		progress: vscode.Progress<vscode.LanguageModelResponsePart2>,
 		token: vscode.CancellationToken
-	): Promise<any> {
+	): Promise<void> {
 		const endpoint = this._chatEndpoints.find(e => e.model === ModelAliasRegistry.resolveAlias(model.id));
 		if (!endpoint) {
 			throw new Error(`Endpoint not found for model ${model.id}`);
@@ -253,22 +259,34 @@ export class LanguageModelAccess extends Disposable implements IExtensionContrib
 
 	private async _registerEmbeddings(): Promise<void> {
 
-		const embeddingsComputer = this._embeddingsComputer;
-		const embeddingType = EmbeddingType.text3small_512;
-		const model = getWellKnownEmbeddingTypeInfo(embeddingType)?.model;
-		if (!model) {
-			throw new Error(`No model found for embedding type ${embeddingType.id}`);
-		}
+		const dispo = this._register(new MutableDisposable());
 
-		const that = this;
-		this._register(vscode.lm.registerEmbeddingsProvider(`copilot.${model}`, new class implements vscode.EmbeddingsProvider {
-			async provideEmbeddings(input: string[], token: vscode.CancellationToken): Promise<vscode.Embedding[]> {
-				await that._getToken();
 
-				const result = await embeddingsComputer.computeEmbeddings(embeddingType, input, {}, new TelemetryCorrelationId('EmbeddingsProvider::provideEmbeddings'), token);
-				return result.values.map(embedding => ({ values: embedding.value.slice(0) }));
+		const update = async () => {
+
+			if (!await this._getToken()) {
+				dispo.clear();
+				return;
 			}
-		}));
+
+			const embeddingsComputer = this._embeddingsComputer;
+			const embeddingType = EmbeddingType.text3small_512;
+			const model = getWellKnownEmbeddingTypeInfo(embeddingType)?.model;
+			if (!model) {
+				throw new Error(`No model found for embedding type ${embeddingType.id}`);
+			}
+
+			dispo.clear();
+			dispo.value = vscode.lm.registerEmbeddingsProvider(`copilot.${model}`, new class implements vscode.EmbeddingsProvider {
+				async provideEmbeddings(input: string[], token: vscode.CancellationToken): Promise<vscode.Embedding[]> {
+					const result = await embeddingsComputer.computeEmbeddings(embeddingType, input, {}, new TelemetryCorrelationId('EmbeddingsProvider::provideEmbeddings'), token);
+					return result.values.map(embedding => ({ values: embedding.value.slice(0) }));
+				}
+			});
+		};
+
+		this._register(this._authenticationService.onDidAuthenticationChange(() => update()));
+		await update();
 	}
 
 	private async _getToken(): Promise<CopilotToken | undefined> {
@@ -329,12 +347,13 @@ export class CopilotLanguageModelWrapper extends Disposable {
 		@IInstantiationService private readonly _instantiationService: IInstantiationService,
 		@ILogService private readonly _logService: ILogService,
 		@IAuthenticationService private readonly _authenticationService: IAuthenticationService,
-		@IEnvService private readonly _envService: IEnvService
+		@IEnvService private readonly _envService: IEnvService,
+		@IEndpointProvider private readonly _endpointProvider: IEndpointProvider,
 	) {
 		super();
 	}
 
-	private async _provideLanguageModelResponse(_endpoint: IChatEndpoint, _messages: Array<vscode.LanguageModelChatMessage | vscode.LanguageModelChatMessage2>, _options: vscode.ProvideLanguageModelChatResponseOptions, extensionId: string, callback: FinishedCallback, token: vscode.CancellationToken): Promise<any> {
+	private async _provideLanguageModelResponse(_endpoint: IChatEndpoint, _messages: Array<vscode.LanguageModelChatMessage | vscode.LanguageModelChatMessage2>, _options: vscode.ProvideLanguageModelChatResponseOptions, extensionId: string, callback: FinishedCallback, token: vscode.CancellationToken): Promise<void> {
 
 		const extensionInfo = extensionId === 'core' ? { packageJSON: { version: this._envService.vscodeVersion } } : vscode.extensions.getExtension(extensionId, true);
 		if (!extensionInfo || typeof extensionInfo.packageJSON.version !== 'string') {
@@ -444,7 +463,7 @@ export class CopilotLanguageModelWrapper extends Disposable {
 				this._blockedExtensionService.reportBlockedExtension(extensionId, result.retryAfter);
 				throw vscode.LanguageModelError.Blocked(blockedExtensionMessage);
 			} else if (result.type === ChatFetchResponseType.QuotaExceeded) {
-				const details = getErrorDetailsFromChatFetchError(result, (await this._authenticationService.getCopilotToken()).copilotPlan);
+				const details = getErrorDetailsFromChatFetchError(result, await this._endpointProvider.getChatEndpoint('copilot-base'), (await this._authenticationService.getCopilotToken()).copilotPlan);
 				const err = new vscode.LanguageModelError(details.message);
 				err.name = 'ChatQuotaExceeded';
 				throw err;
@@ -473,7 +492,7 @@ export class CopilotLanguageModelWrapper extends Disposable {
 		);
 	}
 
-	async provideLanguageModelResponse(endpoint: IChatEndpoint, messages: Array<vscode.LanguageModelChatMessage | vscode.LanguageModelChatMessage2>, options: vscode.ProvideLanguageModelChatResponseOptions, extensionId: string, progress: vscode.Progress<LMResponsePart>, token: vscode.CancellationToken): Promise<any> {
+	async provideLanguageModelResponse(endpoint: IChatEndpoint, messages: Array<vscode.LanguageModelChatMessage | vscode.LanguageModelChatMessage2>, options: vscode.ProvideLanguageModelChatResponseOptions, extensionId: string, progress: vscode.Progress<LMResponsePart>, token: vscode.CancellationToken): Promise<void> {
 		let thinkingActive = false;
 		const finishCallback: FinishedCallback = async (_text, index, delta): Promise<undefined> => {
 			if (delta.thinking) {
@@ -602,13 +621,13 @@ export class CopilotLanguageModelWrapper extends Disposable {
 }
 
 
-function or(...checks: ((value: any) => boolean)[]): (value: any) => boolean {
+function or(...checks: ((value: unknown) => boolean)[]): (value: unknown) => boolean {
 	return (value) => checks.some(check => check(value));
 }
 
 class LanguageModelOptions {
 
-	private static _defaultDesc: Record<string, (value: any) => boolean> = {
+	private static _defaultDesc: Record<string, (value: unknown) => boolean> = {
 		stop: or(isStringArray, isString),
 		temperature: isNumber,
 		max_tokens: isNumber,
@@ -618,15 +637,18 @@ class LanguageModelOptions {
 
 	static Default = new LanguageModelOptions({ ...this._defaultDesc });
 
-	constructor(private _description: Record<string, (value: any) => boolean>) { }
+	constructor(private _description: Record<string, (value: unknown) => boolean>) { }
 
-	convert(options: { [name: string]: any }): Record<string, number | boolean | string> {
+	convert(options: { [name: string]: unknown }): Record<string, number | boolean | string> {
 		const result: Record<string, number | boolean | string> = {};
 		for (const key in this._description) {
 			const isValid = this._description[key];
 			const value = options[key];
 			if (value !== null && value !== undefined && isValid(value)) {
-				result[key] = value;
+				// Type guards ensure we only add values of the correct type
+				if (isNumber(value) || isBoolean(value) || isString(value)) {
+					result[key] = value;
+				}
 			}
 		}
 		return result;

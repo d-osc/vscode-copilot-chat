@@ -10,11 +10,12 @@ import { BudgetExceededError } from '@vscode/prompt-tsx/dist/base/materialized';
 import type * as vscode from 'vscode';
 import { ChatLocation, ChatResponse } from '../../../platform/chat/common/commonTypes';
 import { ConfigKey, IConfigurationService } from '../../../platform/configuration/common/configurationService';
-import { modelCanUseApplyPatchExclusively, modelCanUseReplaceStringExclusively, modelSupportsApplyPatch, modelSupportsMultiReplaceString, modelSupportsReplaceString, modelSupportsSimplifiedApplyPatchInstructions } from '../../../platform/endpoint/common/chatModelCapabilities';
+import { isAnthropicFamily, modelCanUseApplyPatchExclusively, modelCanUseReplaceStringExclusively, modelSupportsApplyPatch, modelSupportsMultiReplaceString, modelSupportsReplaceString, modelSupportsSimplifiedApplyPatchInstructions } from '../../../platform/endpoint/common/chatModelCapabilities';
 import { IEndpointProvider } from '../../../platform/endpoint/common/endpointProvider';
 import { IEnvService } from '../../../platform/env/common/envService';
 import { ILogService } from '../../../platform/log/common/logService';
 import { IEditLogService } from '../../../platform/multiFileEdit/common/editLogService';
+import { isAnthropicContextEditingEnabled } from '../../../platform/networking/common/anthropic';
 import { IChatEndpoint } from '../../../platform/networking/common/networking';
 import { INotebookService } from '../../../platform/notebook/common/notebookService';
 import { IPromptPathRepresentationService } from '../../../platform/prompts/common/promptPathRepresentationService';
@@ -23,107 +24,105 @@ import { IExperimentationService } from '../../../platform/telemetry/common/null
 import { ITelemetryService } from '../../../platform/telemetry/common/telemetry';
 import { ITestProvider } from '../../../platform/testing/common/testProvider';
 import { IWorkspaceService } from '../../../platform/workspace/common/workspaceService';
-import { CancellationToken } from '../../../util/vs/base/common/cancellation';
-import { Event } from '../../../util/vs/base/common/event';
 import { Iterable } from '../../../util/vs/base/common/iterator';
-import { IInstantiationService } from '../../../util/vs/platform/instantiation/common/instantiation';
+import { IInstantiationService, ServicesAccessor } from '../../../util/vs/platform/instantiation/common/instantiation';
 import { ICommandService } from '../../commands/node/commandService';
 import { Intent } from '../../common/constants';
 import { ChatVariablesCollection } from '../../prompt/common/chatVariablesCollection';
-import { Conversation, RenderedUserMessageMetadata } from '../../prompt/common/conversation';
+import { AnthropicTokenUsageMetadata, RenderedUserMessageMetadata } from '../../prompt/common/conversation';
 import { IBuildPromptContext } from '../../prompt/common/intents';
-import { ChatTelemetryBuilder } from '../../prompt/node/chatParticipantTelemetry';
+import { getRequestedToolCallIterationLimit, IContinueOnErrorConfirmation } from '../../prompt/common/specialRequestTypes';
 import { IDefaultIntentRequestHandlerOptions } from '../../prompt/node/defaultIntentRequestHandler';
-import { IDocumentContext } from '../../prompt/node/documentContext';
 import { IBuildPromptResult, IIntent, IIntentInvocation } from '../../prompt/node/intents';
 import { AgentPrompt, AgentPromptProps } from '../../prompts/node/agent/agentPrompt';
+import { AgentPromptCustomizations, PromptRegistry } from '../../prompts/node/agent/promptRegistry';
 import { PromptRenderer } from '../../prompts/node/base/promptRenderer';
 import { ICodeMapperService } from '../../prompts/node/codeMapper/codeMapperService';
-import { TemporalContextStats } from '../../prompts/node/inline/temporalContext';
 import { EditCodePrompt2 } from '../../prompts/node/panel/editCodePrompt2';
+import { NotebookInlinePrompt } from '../../prompts/node/panel/notebookInlinePrompt';
 import { ToolResultMetadata } from '../../prompts/node/panel/toolCalling';
 import { IEditToolLearningService } from '../../tools/common/editToolLearningService';
 import { ContributedToolName, ToolName } from '../../tools/common/toolNames';
 import { IToolsService } from '../../tools/common/toolsService';
-import { VirtualTool } from '../../tools/common/virtualTools/virtualTool';
-import { IToolGroupingService } from '../../tools/common/virtualTools/virtualToolTypes';
 import { applyPatch5Description } from '../../tools/node/applyPatchTool';
+import { getAgentMaxRequests } from '../common/agentConfig';
 import { addCacheBreakpoints } from './cacheBreakpoints';
 import { EditCodeIntent, EditCodeIntentInvocation, EditCodeIntentInvocationOptions, mergeMetadata, toNewChatReferences } from './editCodeIntent';
-import { getRequestedToolCallIterationLimit, IContinueOnErrorConfirmation } from './toolCallingLoop';
-import { NotebookInlinePrompt } from '../../prompts/node/panel/notebookInlinePrompt';
 
-export const getAgentTools = (instaService: IInstantiationService, request: vscode.ChatRequest) =>
-	instaService.invokeFunction(async accessor => {
-		const toolsService = accessor.get<IToolsService>(IToolsService);
-		const testService = accessor.get<ITestProvider>(ITestProvider);
-		const tasksService = accessor.get<ITasksService>(ITasksService);
-		const configurationService = accessor.get<IConfigurationService>(IConfigurationService);
-		const experimentationService = accessor.get<IExperimentationService>(IExperimentationService);
-		const endpointProvider = accessor.get<IEndpointProvider>(IEndpointProvider);
-		const editToolLearningService = accessor.get<IEditToolLearningService>(IEditToolLearningService);
-		const model = await endpointProvider.getChatEndpoint(request);
+export const getAgentTools = async (accessor: ServicesAccessor, request: vscode.ChatRequest) => {
+	const toolsService = accessor.get<IToolsService>(IToolsService);
+	const testService = accessor.get<ITestProvider>(ITestProvider);
+	const tasksService = accessor.get<ITasksService>(ITasksService);
+	const configurationService = accessor.get<IConfigurationService>(IConfigurationService);
+	const experimentationService = accessor.get<IExperimentationService>(IExperimentationService);
+	const endpointProvider = accessor.get<IEndpointProvider>(IEndpointProvider);
+	const editToolLearningService = accessor.get<IEditToolLearningService>(IEditToolLearningService);
+	const model = await endpointProvider.getChatEndpoint(request);
 
-		const allowTools: Record<string, boolean> = {};
+	const allowTools: Record<string, boolean> = {};
 
-		const learned = editToolLearningService.getPreferredEndpointEditTool(model);
-		if (learned) { // a learning-enabled (BYOK) model, we should go with what it prefers
-			allowTools[ToolName.EditFile] = learned.includes(ToolName.EditFile);
-			allowTools[ToolName.ReplaceString] = learned.includes(ToolName.ReplaceString);
-			allowTools[ToolName.MultiReplaceString] = learned.includes(ToolName.MultiReplaceString);
-			allowTools[ToolName.ApplyPatch] = learned.includes(ToolName.ApplyPatch);
-		} else {
-			allowTools[ToolName.EditFile] = true;
-			allowTools[ToolName.ReplaceString] = await modelSupportsReplaceString(model);
-			allowTools[ToolName.ApplyPatch] = await modelSupportsApplyPatch(model) && !!toolsService.getTool(ToolName.ApplyPatch);
+	const learned = editToolLearningService.getPreferredEndpointEditTool(model);
+	if (learned) { // a learning-enabled (BYOK) model, we should go with what it prefers
+		allowTools[ToolName.EditFile] = learned.includes(ToolName.EditFile);
+		allowTools[ToolName.ReplaceString] = learned.includes(ToolName.ReplaceString);
+		allowTools[ToolName.MultiReplaceString] = learned.includes(ToolName.MultiReplaceString);
+		allowTools[ToolName.ApplyPatch] = learned.includes(ToolName.ApplyPatch);
+	} else {
+		allowTools[ToolName.EditFile] = true;
+		allowTools[ToolName.ReplaceString] = modelSupportsReplaceString(model);
+		allowTools[ToolName.ApplyPatch] = modelSupportsApplyPatch(model) && !!toolsService.getTool(ToolName.ApplyPatch);
 
-			if (allowTools[ToolName.ApplyPatch] && await modelCanUseApplyPatchExclusively(model)) {
-				allowTools[ToolName.EditFile] = false;
-			}
-
-			if (await modelCanUseReplaceStringExclusively(model)) {
-				allowTools[ToolName.ReplaceString] = true;
-				allowTools[ToolName.EditFile] = false;
-			}
-
-			if (allowTools[ToolName.ReplaceString] && await modelSupportsMultiReplaceString(model)) {
-				allowTools[ToolName.MultiReplaceString] = true;
-			}
-		}
-
-		allowTools[ToolName.RunTests] = await testService.hasAnyTests();
-		allowTools[ToolName.CoreRunTask] = tasksService.getTasks().length > 0;
-
-		if (model.family === 'gpt-5-codex' || model.family.includes('grok-code')) {
-			allowTools[ToolName.CoreManageTodoList] = false;
-		}
-
-		allowTools[ToolName.EditFilesPlaceholder] = false;
-		if (request.tools.get(ContributedToolName.EditFilesPlaceholder) === false) {
-			allowTools[ToolName.ApplyPatch] = false;
+		if (allowTools[ToolName.ApplyPatch] && modelCanUseApplyPatchExclusively(model)) {
 			allowTools[ToolName.EditFile] = false;
-			allowTools[ToolName.ReplaceString] = false;
-			allowTools[ToolName.MultiReplaceString] = false;
 		}
 
-		const tools = toolsService.getEnabledTools(request, tool => {
-			if (typeof allowTools[tool.name] === 'boolean') {
-				return allowTools[tool.name];
-			}
-
-			// Must return undefined to fall back to other checks
-			return undefined;
-		});
-
-		if (modelSupportsSimplifiedApplyPatchInstructions(model) && configurationService.getExperimentBasedConfig(ConfigKey.Internal.Gpt5AlternativePatch, experimentationService)) {
-			const ap = tools.findIndex(t => t.name === ToolName.ApplyPatch);
-			if (ap !== -1) {
-				tools[ap] = { ...tools[ap], description: applyPatch5Description };
-			}
+		if (modelCanUseReplaceStringExclusively(model)) {
+			allowTools[ToolName.ReplaceString] = true;
+			allowTools[ToolName.EditFile] = false;
 		}
 
-		return tools;
+		if (allowTools[ToolName.ReplaceString] && modelSupportsMultiReplaceString(model)) {
+			allowTools[ToolName.MultiReplaceString] = true;
+		}
+	}
+
+	allowTools[ToolName.CoreRunTest] = await testService.hasAnyTests();
+	allowTools[ToolName.CoreRunTask] = tasksService.getTasks().length > 0;
+
+	if (model.family.includes('grok-code')) {
+		allowTools[ToolName.CoreManageTodoList] = false;
+	}
+
+	allowTools[ToolName.EditFilesPlaceholder] = false;
+	if (request.tools.get(ContributedToolName.EditFilesPlaceholder) === false) {
+		allowTools[ToolName.ApplyPatch] = false;
+		allowTools[ToolName.EditFile] = false;
+		allowTools[ToolName.ReplaceString] = false;
+		allowTools[ToolName.MultiReplaceString] = false;
+	}
+
+	if (model.family.toLowerCase().includes('gemini-3') && configurationService.getExperimentBasedConfig(ConfigKey.Advanced.Gemini3MultiReplaceString, experimentationService)) {
+		allowTools[ToolName.MultiReplaceString] = true;
+	}
+
+	const tools = toolsService.getEnabledTools(request, model, tool => {
+		if (typeof allowTools[tool.name] === 'boolean') {
+			return allowTools[tool.name];
+		}
+
+		// Must return undefined to fall back to other checks
+		return undefined;
 	});
+
+	if (modelSupportsSimplifiedApplyPatchInstructions(model) && configurationService.getExperimentBasedConfig(ConfigKey.Advanced.Gpt5AlternativePatch, experimentationService)) {
+		const ap = tools.findIndex(t => t.name === ToolName.ApplyPatch);
+		if (ap !== -1) {
+			tools[ap] = { ...tools[ap], description: applyPatch5Description };
+		}
+	}
+
+	return tools;
+};
 
 export class AgentIntent extends EditCodeIntent {
 
@@ -138,56 +137,15 @@ export class AgentIntent extends EditCodeIntent {
 		@IExperimentationService expService: IExperimentationService,
 		@ICodeMapperService codeMapperService: ICodeMapperService,
 		@IWorkspaceService workspaceService: IWorkspaceService,
-		@IToolGroupingService private readonly _toolGroupingService: IToolGroupingService,
 	) {
 		super(instantiationService, endpointProvider, configurationService, expService, codeMapperService, workspaceService, { intentInvocation: AgentIntentInvocation, processCodeblocks: false });
-	}
-
-	override async handleRequest(conversation: Conversation, request: vscode.ChatRequest, stream: vscode.ChatResponseStream, token: CancellationToken, documentContext: IDocumentContext | undefined, agentName: string, location: ChatLocation, chatTelemetry: ChatTelemetryBuilder, onPaused: Event<boolean>): Promise<vscode.ChatResult> {
-		if (request.command === 'list') {
-			await this.listTools(conversation, request, stream, token);
-			return {};
-		}
-
-		return super.handleRequest(conversation, request, stream, token, documentContext, agentName, location, chatTelemetry, onPaused);
-	}
-
-	private async listTools(conversation: Conversation, request: vscode.ChatRequest, stream: vscode.ChatResponseStream, token: CancellationToken) {
-		const editingTools = await getAgentTools(this.instantiationService, request);
-		const grouping = this._toolGroupingService.create(conversation.sessionId, editingTools);
-
-		let str = 'Available tools:\n';
-		function printTool(tool: vscode.LanguageModelToolInformation | VirtualTool, indent = 0) {
-			const prefix = '  '.repeat(indent * 2);
-			str += `${prefix}- ${tool.name}`;
-			if (tool instanceof VirtualTool) {
-				if (tool.isExpanded) {
-					str += ` (expanded):`;
-				} else {
-					str += ': ' + tool.description.split('\n\n').map((chunk, i) => i > 0 ? prefix + '  ' + chunk : chunk).join('\n\n');
-				}
-			}
-			str += '\n';
-			if (tool instanceof VirtualTool && tool.contents.length > 0) {
-				for (const child of tool.contents) {
-					printTool(child, indent + 1);
-				}
-			}
-		}
-
-		const tools = await grouping.computeAll(request.prompt, token);
-		tools.forEach(t => printTool(t));
-		stream.markdown(str);
-
-		return {};
 	}
 
 	protected override getIntentHandlerOptions(request: vscode.ChatRequest): IDefaultIntentRequestHandlerOptions | undefined {
 		return {
 			maxToolCallIterations: getRequestedToolCallIterationLimit(request) ??
-				this.configurationService.getNonExtensionConfig('chat.agent.maxRequests') ??
-				200, // Fallback for simulation tests
-			temperature: this.configurationService.getConfig(ConfigKey.Internal.AgentTemperature) ?? 0,
+				this.instantiationService.invokeFunction(getAgentMaxRequests),
+			temperature: this.configurationService.getConfig(ConfigKey.Advanced.AgentTemperature) ?? 0,
 			overrideRequestLocation: ChatLocation.Agent,
 			hideRateLimitTimeEstimate: true
 		};
@@ -201,6 +159,8 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 	protected prompt: typeof AgentPrompt | typeof EditCodePrompt2 | typeof NotebookInlinePrompt = AgentPrompt;
 
 	protected extraPromptProps: Partial<AgentPromptProps> | undefined;
+
+	private _resolvedCustomizations: AgentPromptCustomizations | undefined;
 
 	constructor(
 		intent: IIntent,
@@ -221,12 +181,13 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 		@ITelemetryService telemetryService: ITelemetryService,
 		@INotebookService notebookService: INotebookService,
 		@ILogService private readonly logService: ILogService,
+		@IExperimentationService private readonly expService: IExperimentationService,
 	) {
 		super(intent, location, endpoint, request, intentOptions, instantiationService, codeMapperService, envService, promptPathRepresentationService, endpointProvider, workspaceService, toolsService, configurationService, editLogService, commandService, telemetryService, notebookService);
 	}
 
 	public override getAvailableTools(): Promise<vscode.LanguageModelToolInformation[]> {
-		return getAgentTools(this.instantiationService, this.request);
+		return this.instantiationService.invokeFunction(getAgentTools, this.request);
 	}
 
 	override async buildPrompt(
@@ -234,6 +195,7 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 		progress: vscode.Progress<vscode.ChatResponseReferencePart | vscode.ChatResponseProgressPart>,
 		token: vscode.CancellationToken
 	): Promise<IBuildPromptResult> {
+		this._resolvedCustomizations = await PromptRegistry.resolveAllCustomizations(this.instantiationService, this.endpoint);
 		// Add any references from the codebase invocation to the request
 		const codebase = await this._getCodebaseReferences(promptContext, token);
 
@@ -244,20 +206,61 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 			variables = new ChatVariablesCollection([...this.request.references, ...toolReferences]);
 		}
 
-		const tools = await this.getAvailableTools();
+		const tools = promptContext.tools?.availableTools;
 		const toolTokens = tools?.length ? await this.endpoint.acquireTokenizer().countToolTokens(tools) : 0;
+
+		const summarizeThresholdOverride = this.configurationService.getConfig<number | undefined>(ConfigKey.Advanced.SummarizeAgentConversationHistoryThreshold);
+		if (typeof summarizeThresholdOverride === 'number' && summarizeThresholdOverride < 100) {
+			throw new Error(`Setting github.copilot.${ConfigKey.Advanced.SummarizeAgentConversationHistoryThreshold.id} is too low`);
+		}
 
 		// Reserve extra space when tools are involved due to token counting issues
 		const baseBudget = Math.min(
-			this.configurationService.getConfig<number | undefined>(ConfigKey.Internal.SummarizeAgentConversationHistoryThreshold) ?? this.endpoint.modelMaxPromptTokens,
+			this.configurationService.getConfig<number | undefined>(ConfigKey.Advanced.SummarizeAgentConversationHistoryThreshold) ?? this.endpoint.modelMaxPromptTokens,
 			this.endpoint.modelMaxPromptTokens
 		);
-		const useTruncation = this.configurationService.getConfig(ConfigKey.Internal.UseResponsesApiTruncation);
-		const safeBudget = useTruncation ?
-			Number.MAX_SAFE_INTEGER :
-			Math.floor((baseBudget - toolTokens) * 0.85);
-		const endpoint = toolTokens > 0 ? this.endpoint.cloneWithTokenOverride(safeBudget) : this.endpoint;
+		const useTruncation = this.configurationService.getConfig(ConfigKey.Advanced.UseResponsesApiTruncation);
 		const summarizationEnabled = this.configurationService.getConfig(ConfigKey.SummarizeAgentConversationHistory) && this.prompt === AgentPrompt;
+
+		// For Anthropic models with context editing, check previous turn's token usage to determine budget
+		// 1. No token usage info (no prev turn) -> use normal safeBudget and let prompt rendering handle BudgetExceededError
+		// 2. Token usage + current turn > threshold -> throw BudgetExceededError to trigger summarization
+		// 3. Token usage + current turn < threshold -> use MAX_SAFE_INTEGER (no summarization needed)
+		let safeBudget: number = -1;
+		let shouldTriggerSummarize = false;
+		const budgetThreshold = Math.floor((baseBudget - toolTokens) * 0.85);
+
+		const anthropicContextEditingEnabled = isAnthropicContextEditingEnabled(this.configurationService, this.expService);
+		if (summarizationEnabled && isAnthropicFamily(this.endpoint) && anthropicContextEditingEnabled) {
+			// First check current turn for token usage (from tool calling loop), then fall back to previous turn's result metadata
+			const currentTurn = promptContext.conversation?.getLatestTurn();
+			const currentTurnTokenUsage = currentTurn?.getMetadata(AnthropicTokenUsageMetadata);
+			const previousTurn = promptContext.history?.at(-1);
+
+			const promptTokens = currentTurnTokenUsage?.promptTokens ?? previousTurn?.resultMetadata?.promptTokens;
+			const outputTokens = currentTurnTokenUsage?.outputTokens ?? previousTurn?.resultMetadata?.outputTokens;
+
+			if (promptTokens !== undefined && outputTokens !== undefined) {
+				// Estimate total tokens from the last completed turn (prompt + output) and add a 15% buffer to anticipate growth in the upcoming turn/tool call
+				const totalEstimatedTokens = (promptTokens + outputTokens) * 1.15;
+
+				if (totalEstimatedTokens > this.endpoint.modelMaxPromptTokens) {
+					// Will exceed budget - trigger summarization
+					shouldTriggerSummarize = true;
+					safeBudget = budgetThreshold; // Use normal budget for the summarization render
+					this.logService.debug(`AgentIntent: token usage exceeds threshold, will trigger summarization (promptTokens=${promptTokens}, outputTokens=${outputTokens}, total=${totalEstimatedTokens}, threshold=${budgetThreshold})`);
+				} else {
+					// Under budget - no summarization needed, use unlimited budget
+					safeBudget = Number.MAX_SAFE_INTEGER;
+					this.logService.debug(`AgentIntent: token usage under threshold, skipping summarization (promptTokens=${promptTokens}, outputTokens=${outputTokens}, total=${totalEstimatedTokens}, threshold=${budgetThreshold})`);
+				}
+			}
+		}
+		if (safeBudget < 0) {
+			safeBudget = useTruncation ? Number.MAX_SAFE_INTEGER : budgetThreshold;
+		}
+		const endpoint = toolTokens > 0 ? this.endpoint.cloneWithTokenOverride(safeBudget) : this.endpoint;
+
 		this.logService.debug(`AgentIntent: rendering with budget=${safeBudget} (baseBudget: ${baseBudget}, toolTokens: ${toolTokens}), summarizationEnabled=${summarizationEnabled}`);
 		let result: RenderPromptResult;
 		const props: AgentPromptProps = {
@@ -271,51 +274,73 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 			},
 			location: this.location,
 			enableCacheBreakpoints: summarizationEnabled,
-			...this.extraPromptProps
+			...this.extraPromptProps,
+			customizations: this._resolvedCustomizations
 		};
-		try {
-			const renderer = PromptRenderer.create(this.instantiationService, endpoint, this.prompt, props);
-			result = await renderer.render(progress, token);
-		} catch (e) {
-			if (e instanceof BudgetExceededError && summarizationEnabled) {
-				this.logService.debug(`[Agent] budget exceeded, triggering summarization (${e.message})`);
-				if (!promptContext.toolCallResults) {
-					promptContext = {
-						...promptContext,
-						toolCallResults: {}
-					};
-				}
-				e.metadata.getAll(ToolResultMetadata).forEach((metadata) => {
-					promptContext.toolCallResults![metadata.toolCallId] = metadata.result;
+
+		// Helper function for summarization flow with fallbacks
+		const renderWithSummarization = async (reason: string, renderProps: AgentPromptProps = props): Promise<RenderPromptResult> => {
+			this.logService.debug(`[Agent] ${reason}, triggering summarization`);
+			try {
+				const renderer = PromptRenderer.create(this.instantiationService, endpoint, this.prompt, {
+					...renderProps,
+					triggerSummarize: true,
+				});
+				return await renderer.render(progress, token);
+			} catch (e) {
+				this.logService.error(e, `[Agent] summarization failed`);
+				const errorKind = e instanceof BudgetExceededError ? 'budgetExceeded' : 'error';
+				/* __GDPR__
+					"triggerSummarizeFailed" : {
+						"owner": "roblourens",
+						"comment": "Tracks when triggering summarization failed - for example, a summary was created but not applied successfully.",
+						"errorKind": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The success state or failure reason of the summarization." },
+						"model": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The model ID used for the summarization." }
+					}
+				*/
+				this.telemetryService.sendMSFTTelemetryEvent('triggerSummarizeFailed', { errorKind, model: renderProps.endpoint.model });
+
+				// Something else went wrong, eg summarization failed, so render the prompt with no cache breakpoints, summarization, endpoint not reduced in size for tools or safety buffer
+				const renderer = PromptRenderer.create(this.instantiationService, this.endpoint, this.prompt, {
+					...renderProps,
+					endpoint: this.endpoint,
+					enableCacheBreakpoints: false
 				});
 				try {
-					const renderer = PromptRenderer.create(this.instantiationService, endpoint, this.prompt, {
-						...props,
-						triggerSummarize: true,
-					});
-					result = await renderer.render(progress, token);
+					return await renderer.render(progress, token);
 				} catch (e) {
-					this.logService.error(e, `[Agent] summarization failed`);
-					const errorKind = e instanceof BudgetExceededError ? 'budgetExceeded' : 'error';
-					/* __GDPR__
-						"triggerSummarizeFailed" : {
-							"owner": "roblourens",
-							"comment": "Tracks when triggering summarization failed - for example, a summary was created but not applied successfully.",
-							"errorKind": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The success state or failure reason of the summarization." },
-							"model": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The model ID used for the summarization." }
-						}
-					*/
-					this.telemetryService.sendMSFTTelemetryEvent('triggerSummarizeFailed', { errorKind, model: props.endpoint.model });
-
-					// Something else went wrong, eg summarization failed, so render the prompt with no cache breakpoints or summarization
-					const renderer = PromptRenderer.create(this.instantiationService, endpoint, this.prompt, {
-						...props,
-						enableCacheBreakpoints: false
-					});
-					result = await renderer.render(progress, token);
+					if (e instanceof BudgetExceededError) {
+						this.logService.error(e, `[Agent] final render fallback failed due to budget exceeded`);
+						const maxTokens = this.endpoint.modelMaxPromptTokens;
+						throw new Error(`Unable to build prompt, modelMaxPromptTokens = ${maxTokens} (${e.message})`);
+					}
+					throw e;
 				}
-			} else {
-				throw e;
+			}
+		};
+
+		if (shouldTriggerSummarize) {
+			// Token usage from previous turn indicates we'll exceed budget - go directly to summarization flow
+			result = await renderWithSummarization('token usage from previous turn exceeds budget threshold');
+		} else {
+			try {
+				const renderer = PromptRenderer.create(this.instantiationService, endpoint, this.prompt, props);
+				result = await renderer.render(progress, token);
+			} catch (e) {
+				if (e instanceof BudgetExceededError && summarizationEnabled) {
+					if (!promptContext.toolCallResults) {
+						promptContext = {
+							...promptContext,
+							toolCallResults: {}
+						};
+					}
+					e.metadata.getAll(ToolResultMetadata).forEach((metadata) => {
+						promptContext.toolCallResults![metadata.toolCallId] = metadata.result;
+					});
+					result = await renderWithSummarization(`budget exceeded(${e.message})`);
+				} else {
+					throw e;
+				}
 			}
 		}
 
@@ -338,7 +363,6 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 			});
 		}
 
-		const tempoStats = result.metadata.get(TemporalContextStats);
 
 		return {
 			...result,
@@ -349,7 +373,6 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 			// Don't report file references that came in via chat variables in an editing session, unless they have warnings,
 			// because they are already displayed as part of the working set
 			// references: result.references.filter((ref) => this.shouldKeepReference(editCodeStep, ref, toolReferences, chatVariables)),
-			telemetryData: tempoStats && [tempoStats]
 		};
 	}
 

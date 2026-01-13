@@ -19,9 +19,9 @@ import { IImageService } from '../../../../platform/image/common/imageService';
 import { ILogService } from '../../../../platform/log/common/logService';
 import { IExperimentationService } from '../../../../platform/telemetry/common/nullExperimentationService';
 import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry';
+import { toErrorMessage } from '../../../../util/common/errorMessage';
 import { ITokenizer } from '../../../../util/common/tokenizer';
 import { CancellationToken } from '../../../../util/vs/base/common/cancellation';
-import { toErrorMessage } from '../../../../util/vs/base/common/errorMessage';
 import { isCancellationError } from '../../../../util/vs/base/common/errors';
 import { URI, UriComponents } from '../../../../util/vs/base/common/uri';
 import { IInstantiationService, ServicesAccessor } from '../../../../util/vs/platform/instantiation/common/instantiation';
@@ -382,7 +382,7 @@ export async function imageDataPartToTSX(part: LanguageModelDataPart, githubToke
 			}
 		}
 
-		return <Image src={imageSource} />;
+		return <Image src={imageSource} mimeType={part.mimeType} />;
 	}
 }
 
@@ -461,6 +461,14 @@ interface IPrimitiveToolResultProps extends BasePromptElementProps {
 class PrimitiveToolResult<T extends IPrimitiveToolResultProps> extends PromptElement<T> {
 	protected readonly linkedResources: LanguageModelDataPart[];
 
+	/**
+	 * Some models do not yet support CAPI image uploads. For these cases,
+	 * track the number of images bytes we're sending and truncate any images
+	 * that would exceed that budget. Current CAPI default is 5MB, so allow
+	 * images to use half of that.
+	 */
+	private imageSizeBudgetLeft = (5 * 1024 * 1024) / 2; // 5MB
+
 	constructor(
 		props: T,
 		@IPromptEndpoint protected readonly endpoint: IPromptEndpoint,
@@ -490,7 +498,7 @@ class PrimitiveToolResult<T extends IPrimitiveToolResultProps> extends PromptEle
 							return await this.onData(part);
 						}
 					}))}
-					{this.linkedResources.length > 0 && `Hint: you can read the full contents of any ${this.linkedResources.length > DONT_INCLUDE_RESOURCE_CONTENT_IF_TOOL_HAS_MORE_THAN ? '' : 'truncated '}resources by passing their URIs as the absolutePath to the ${ToolName.ReadFile}.\n`}
+					{this.linkedResources.length > 0 && `\n\nHint: you can read the full contents of any ${this.linkedResources.length > DONT_INCLUDE_RESOURCE_CONTENT_IF_TOOL_HAS_MORE_THAN ? '' : 'truncated '}resources by passing their URIs as the absolutePath to the ${ToolName.ReadFile}.\n`}
 				</IfEmpty>
 			</>
 		);
@@ -515,15 +523,26 @@ class PrimitiveToolResult<T extends IPrimitiveToolResultProps> extends PromptEle
 	}
 
 	protected async onImage(part: LanguageModelDataPart) {
-		const githubToken = (await this.authService.getAnyGitHubSession())?.accessToken;
+		const githubToken = (await this.authService.getGitHubSession('any', { silent: true }))?.accessToken;
 		const uploadsEnabled = this.configurationService && this.experimentationService
 			? this.configurationService.getExperimentBasedConfig(ConfigKey.EnableChatImageUpload, this.experimentationService)
 			: false;
 
 		// Anthropic (from CAPI) currently does not support image uploads from tool calls.
-		const effectiveToken = uploadsEnabled && await modelCanUseMcpResultImageURL(this.endpoint) ? githubToken : undefined;
+		const uploadToken = uploadsEnabled && modelCanUseMcpResultImageURL(this.endpoint) ? githubToken : undefined;
 
-		return Promise.resolve(imageDataPartToTSX(part, effectiveToken, this.endpoint.urlOrRequestMetadata, this.logService, this.imageService));
+		if (!uploadToken) {
+			if (this.imageSizeBudgetLeft < 0) {
+				return ''; // already exceeded and messages about it
+			} else if (part.data.length > this.imageSizeBudgetLeft) {
+				this.imageSizeBudgetLeft = -1; // just now exceeding
+				return 'Additional images are available, but there is no more space in the context. Try requesting a smaller amount of data, if possible.';
+			} else {
+				this.imageSizeBudgetLeft -= part.data.length; // bookkeep
+			}
+		}
+
+		return Promise.resolve(imageDataPartToTSX(part, uploadToken, this.endpoint.urlOrRequestMetadata, this.logService, this.imageService));
 	}
 
 	protected onTSX(part: JSONTree.PromptElementJSON) {

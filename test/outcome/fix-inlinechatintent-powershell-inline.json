@@ -2,7 +2,9 @@
 	{
 		"name": "fix-InlineChatIntent (powershell) [inline] [powershell] - Issue #7894",
 		"requests": [
-			"848c7d2f291363cc196709158fd083f44ac3eedbb9a52b5cbb36f8ec8ccf74af"
+			"1551b4e94a65caee114e67f36a8eedf2a1730688241dfa7e572386384c7a6a47",
+			"a546cf5ba04d7c3feae83c3c1f17a7dd10720bd398ee733c21787196c360d25d",
+			"b9a5da1a4164b965de2c93445a3ba2a401464a6ae02d6bddeca00e63b49af70e"
 		]
 	}
 ]

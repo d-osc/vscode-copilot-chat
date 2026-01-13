@@ -2,7 +2,7 @@
 	{
 		"name": "fix-InlineChatIntent (ruff) [inline] [python] - Ruff(E231) Missing whitespace after ':'",
 		"requests": [
-			"c48a1dda3d254ddeca3eca6d6f535ad18fba842260da046c391b9a25607adb31"
+			"a112fbab47a73f79e051ce96fe4e198366dee381d47dfd5c87b6f69ecd63b229"
 		]
 	}
 ]

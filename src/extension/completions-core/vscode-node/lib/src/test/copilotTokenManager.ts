@@ -3,18 +3,15 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { CopilotToken, type ExtendedTokenInfo, type TokenInfo } from '../../../../../../platform/authentication/common/copilotToken';
-import { generateUuid } from '../../../../../../util/vs/base/common/uuid';
-import { CopilotTokenManager } from '../auth/copilotTokenManager';
-import { ICompletionsContextService } from '../context';
+import { CopilotToken, createTestExtendedTokenInfo, type ExtendedTokenInfo } from '../../../../../../platform/authentication/common/copilotToken';
+import { ICompletionsCopilotTokenManager } from '../auth/copilotTokenManager';
 
 // Buffer to allow refresh to happen successfully
-export class FakeCopilotTokenManager extends CopilotTokenManager {
-
+export class FakeCopilotTokenManager implements ICompletionsCopilotTokenManager {
+	declare _serviceBrand: undefined;
 	private _token: CopilotToken;
 
-	constructor(@ICompletionsContextService protected ctx: ICompletionsContextService) {
-		super();
+	constructor() {
 		this._token = FakeCopilotTokenManager.createTestCopilotToken({ token: 'tid=test;rt=1' });
 	}
 
@@ -33,22 +30,13 @@ export class FakeCopilotTokenManager extends CopilotTokenManager {
 	resetToken(httpError?: number): void {
 	}
 
-	getLastToken(): Omit<CopilotToken, "token"> | undefined {
+	getLastToken(): Omit<CopilotToken, 'token'> | undefined {
 		return this._token;
 	}
 
 	private static readonly REFRESH_BUFFER_SECONDS = 60;
-	private static createTestCopilotToken(tokenInfo?: Partial<Omit<TokenInfo, 'expires_at'>>): CopilotToken {
-		const expires_at = Date.now() + ((tokenInfo?.refresh_in ?? 0) + FakeCopilotTokenManager.REFRESH_BUFFER_SECONDS) * 1000;
-		const realToken: ExtendedTokenInfo = {
-			token: `test token ${generateUuid()}`,
-			username: 'testuser',
-			isVscodeTeamMember: false,
-			copilot_plan: 'free',
-			refresh_in: 0,
-			expires_at,
-			...tokenInfo
-		};
-		return new CopilotToken(realToken);
+	private static createTestCopilotToken(overrides?: Partial<Omit<ExtendedTokenInfo, 'expires_at'>>): CopilotToken {
+		const expires_at = Date.now() + ((overrides?.refresh_in ?? 0) + FakeCopilotTokenManager.REFRESH_BUFFER_SECONDS) * 1000;
+		return new CopilotToken(createTestExtendedTokenInfo({ expires_at, ...overrides }));
 	}
 }

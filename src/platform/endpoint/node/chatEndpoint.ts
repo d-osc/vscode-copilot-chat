@@ -28,8 +28,10 @@ import { ITelemetryService, TelemetryProperties } from '../../telemetry/common/t
 import { TelemetryData } from '../../telemetry/common/telemetryData';
 import { ITokenizerProvider } from '../../tokenizer/node/tokenizer';
 import { ICAPIClientService } from '../common/capiClient';
+import { isAnthropicFamily } from '../common/chatModelCapabilities';
 import { IDomainService } from '../common/domainService';
 import { CustomModel, IChatModelInformation, ModelPolicy, ModelSupportedEndpoint } from '../common/endpointProvider';
+import { createMessagesRequestBody, processResponseFromMessagesEndpoint } from './messagesApi';
 import { createResponsesRequestBody, processResponseFromChatEndpoint } from './responsesApi';
 
 /**
@@ -167,7 +169,38 @@ export class ChatEndpoint implements IChatEndpoint {
 	}
 
 	public getExtraHeaders(): Record<string, string> {
-		return this.modelMetadata.requestHeaders ?? {};
+		const headers: Record<string, string> = { ...this.modelMetadata.requestHeaders };
+
+		if (this.useMessagesApi) {
+			const betaFeatures: string[] = [];
+
+			// Add thinking beta if enabled
+			if (this._getThinkingBudget()) {
+				betaFeatures.push('interleaved-thinking-2025-05-14');
+			}
+
+			// Add context management beta if enabled
+			const contextEditingEnabled = this._configurationService.getConfig(ConfigKey.AnthropicContextEditingEnabled);
+			if (contextEditingEnabled) {
+				betaFeatures.push('context-management-2025-06-27');
+			}
+
+			if (betaFeatures.length > 0) {
+				headers['anthropic-beta'] = betaFeatures.join(',');
+			}
+		}
+
+		return headers;
+	}
+
+	private _getThinkingBudget(): number | undefined {
+		const configuredBudget = this._configurationService.getExperimentBasedConfig(ConfigKey.AnthropicThinkingBudget, this._expService);
+		if (!configuredBudget || configuredBudget <= 0) {
+			return undefined;
+		}
+		const normalizedBudget = configuredBudget < 1024 ? 1024 : configuredBudget;
+		// Cap thinking budget to Anthropic's recommended max (32000), and ensure it's less than max output tokens
+		return Math.min(32000, this._maxOutputTokens - 1, normalizedBudget);
 	}
 
 	public get modelMaxPromptTokens(): number {
@@ -182,7 +215,8 @@ export class ChatEndpoint implements IChatEndpoint {
 		// Use override or respect setting.
 		// TODO unlikely but would break if it changes in the middle of a request being constructed
 		return this.modelMetadata.urlOrRequestMetadata ??
-			(this.useResponsesApi ? { type: RequestType.ChatResponses } : { type: RequestType.ChatCompletions });
+			(this.useResponsesApi ? { type: RequestType.ChatResponses } :
+				this.useMessagesApi ? { type: RequestType.ChatMessages } : { type: RequestType.ChatCompletions });
 	}
 
 	protected get useResponsesApi(): boolean {
@@ -193,8 +227,12 @@ export class ChatEndpoint implements IChatEndpoint {
 			return true;
 		}
 
-		const enableResponsesApi = this._configurationService.getExperimentBasedConfig(ConfigKey.UseResponsesApi, this._expService);
-		return !!(enableResponsesApi && this.modelMetadata.supported_endpoints?.includes(ModelSupportedEndpoint.Responses));
+		return !!this.modelMetadata.supported_endpoints?.includes(ModelSupportedEndpoint.Responses);
+	}
+
+	protected get useMessagesApi(): boolean {
+		const enableMessagesApi = this._configurationService.getExperimentBasedConfig(ConfigKey.UseAnthropicMessagesApi, this._expService);
+		return !!(enableMessagesApi && this.modelMetadata.supported_endpoints?.includes(ModelSupportedEndpoint.Messages));
 	}
 
 	public get degradationReason(): string | undefined {
@@ -212,7 +250,8 @@ export class ChatEndpoint implements IChatEndpoint {
 	}
 
 	public get apiType(): string {
-		return this.useResponsesApi ? 'responses' : 'chatCompletions';
+		return this.useResponsesApi ? 'responses' :
+			this.useMessagesApi ? 'messages' : 'chatCompletions';
 	}
 
 	interceptBody(body: IEndpointBody | undefined): void {
@@ -246,11 +285,14 @@ export class ChatEndpoint implements IChatEndpoint {
 
 	createRequestBody(options: ICreateEndpointBodyOptions): IEndpointBody {
 		if (this.useResponsesApi) {
-			const body = this._instantiationService.invokeFunction(createResponsesRequestBody, options, this.model, this.modelMetadata);
+			const body = this._instantiationService.invokeFunction(createResponsesRequestBody, options, this.model, this);
 			return this.customizeResponsesBody(body);
+		} else if (this.useMessagesApi) {
+			const body = this._instantiationService.invokeFunction(createMessagesRequestBody, options, this.model, this);
+			return this.customizeMessagesBody(body);
 		} else {
 			const body = createCapiRequestBody(options, this.model, this.getCompletionsCallback());
-			return this.customizeCapiBody(body);
+			return this.customizeCapiBody(body, options);
 		}
 	}
 
@@ -258,11 +300,36 @@ export class ChatEndpoint implements IChatEndpoint {
 		return undefined;
 	}
 
+	protected customizeMessagesBody(body: IEndpointBody): IEndpointBody {
+		return body;
+	}
+
 	protected customizeResponsesBody(body: IEndpointBody): IEndpointBody {
 		return body;
 	}
 
-	protected customizeCapiBody(body: IEndpointBody): IEndpointBody {
+	protected customizeCapiBody(body: IEndpointBody, options: ICreateEndpointBodyOptions): IEndpointBody {
+		const isConversationAgent = options.location === ChatLocation.Agent;
+		if (isAnthropicFamily(this) && !options.disableThinking && isConversationAgent) {
+			const thinkingBudget = this._getThinkingBudget();
+			if (thinkingBudget) {
+				body.thinking_budget = thinkingBudget;
+			}
+		}
+
+		// Apply Gemini function calling mode if configured
+		const hasTools = !!options.requestOptions?.tools?.length;
+		if (hasTools && this.family.toLowerCase().includes('gemini-3')) {
+			const geminiFunctionCallingMode = this._configurationService.getExperimentBasedConfig(
+				ConfigKey.TeamInternal.GeminiFunctionCallingMode,
+				this._expService
+			);
+			// Only override tool_choice if experiment provides a value and user hasn't specified a function call
+			if (geminiFunctionCallingMode && typeof body.tool_choice !== 'object') {
+				body.tool_choice = geminiFunctionCallingMode;
+			}
+		}
+
 		return body;
 	}
 
@@ -277,6 +344,8 @@ export class ChatEndpoint implements IChatEndpoint {
 	): Promise<AsyncIterableObject<ChatCompletion>> {
 		if (this.useResponsesApi) {
 			return processResponseFromChatEndpoint(this._instantiationService, telemetryService, logService, response, expectedNumChoices, finishCallback, telemetryData);
+		} else if (this.useMessagesApi) {
+			return processResponseFromMessagesEndpoint(this._instantiationService, response, finishCallback, telemetryData);
 		} else if (!this._supportsStreaming) {
 			return defaultNonStreamChatResponseProcessor(response, finishCallback, telemetryData);
 		} else {

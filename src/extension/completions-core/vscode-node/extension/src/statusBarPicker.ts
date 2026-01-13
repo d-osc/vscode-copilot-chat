@@ -2,29 +2,25 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-import { QuickPick, QuickPickItem, QuickPickItemKind, commands, window } from 'vscode';
+import { QuickPick, QuickPickItem, QuickPickItemKind, commands, l10n, window } from 'vscode';
 import { isWeb } from '../../../../../util/vs/base/common/platform';
 import { IInstantiationService } from '../../../../../util/vs/platform/instantiation/common/instantiation';
-import { ICompletionsContextService } from '../../lib/src/context';
 import { isCompletionEnabled, isInlineSuggestEnabled } from './config';
-import { CMDCollectDiagnosticsChat, CMDDisableCompletionsChat, CMDEnableCompletionsChat, CMDOpenDocumentationClient, CMDOpenLogsClient } from './constants';
-import { CopilotExtensionStatus } from './extensionStatus';
+import { CMDCollectDiagnosticsChat, CMDDisableCompletionsChat, CMDEnableCompletionsChat, CMDOpenDocumentationClient, CMDOpenLogsClient, CMDOpenModelPickerClient, CMDOpenPanelClient } from './constants';
+import { ICompletionsExtensionStatus } from './extensionStatus';
 import { Icon } from './icon';
 
 export class CopilotStatusBarPickMenu {
-	private state: CopilotExtensionStatus;
 
 	constructor(
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
-		@ICompletionsContextService private readonly contextService: ICompletionsContextService
-	) {
-		this.state = this.contextService.get(CopilotExtensionStatus);
-	}
+		@ICompletionsExtensionStatus private readonly extensionStatusService: ICompletionsExtensionStatus,
+	) { }
 
 	showStatusMenu() {
 		const quickpickList = window.createQuickPick();
-		quickpickList.placeholder = 'Select an option';
-		quickpickList.title = 'Configure Copilot Completions';
+		quickpickList.placeholder = l10n.t('Select an option');
+		quickpickList.title = l10n.t('Configure Inline Suggestions');
 		quickpickList.items = this.collectQuickPickItems();
 		quickpickList.onDidAccept(() => this.handleItemSelection(quickpickList));
 		quickpickList.show();
@@ -64,11 +60,9 @@ export class CopilotStatusBarPickMenu {
 		if (!this.hasActiveStatus()) { return items; }
 
 		const editor = window.activeTextEditor;
-		//if (!isWeb && editor) { items.push(this.newPanelItem()); }
+		if (!isWeb && editor) { items.push(this.newPanelItem()); }
 		// Always show the model picker even if only one model is available
-		// Except on web where the model picker is not available pending CORS
-		// support from CAPI https://github.com/github/copilot-api/pull/12233
-		//if (!isWeb) { items.push(this.newChangeModelItem()); }
+		if (!isWeb) { items.push(this.newChangeModelItem()); }
 		if (editor) { items.push(...this.newEnableLanguageItem()); }
 		if (items.length) { items.push(this.newSeparator()); }
 
@@ -76,7 +70,7 @@ export class CopilotStatusBarPickMenu {
 	}
 
 	private hasActiveStatus() {
-		return ['Normal'].includes(this.state.kind);
+		return ['Normal'].includes(this.extensionStatusService.kind);
 	}
 
 	private isCompletionEnabled() {
@@ -86,9 +80,9 @@ export class CopilotStatusBarPickMenu {
 	private newEnableLanguageItem() {
 		const isEnabled = this.isCompletionEnabled();
 		if (isEnabled) {
-			return [this.newCommandItem('Disable Completions', CMDDisableCompletionsChat)];
+			return [this.newCommandItem(l10n.t('Disable Inline Suggestions'), CMDDisableCompletionsChat)];
 		} else if (isEnabled === false) {
-			return [this.newCommandItem('Enable Completions', CMDEnableCompletionsChat)];
+			return [this.newCommandItem(l10n.t('Enable Inline Suggestions'), CMDEnableCompletionsChat)];
 		} else {
 			return [];
 		}
@@ -97,63 +91,59 @@ export class CopilotStatusBarPickMenu {
 	private newStatusItem() {
 		let statusText;
 		let statusIcon = Icon.Logo;
-		switch (this.state.kind) {
+		switch (this.extensionStatusService.kind) {
 			case 'Normal':
-				statusText = 'Ready';
+				statusText = l10n.t('Ready');
 				if (isInlineSuggestEnabled() === false) {
-					statusText += ' (VS Code inline suggestions disabled)';
+					statusText += ` (${l10n.t('VS Code inline suggestions disabled')})`;
 				} else if (this.instantiationService.invokeFunction(isCompletionEnabled) === false) {
-					statusText += ' (Disabled)';
+					statusText += ` (${l10n.t('Disabled')})`;
 				}
 				break;
 			case 'Inactive':
-				statusText = this.state.message || 'Copilot is currently inactive';
+				statusText = this.extensionStatusService.message || l10n.t('Copilot is currently inactive');
 				statusIcon = Icon.Blocked;
 				break;
 			default:
-				statusText = this.state.message || 'Copilot has encountered an error';
+				statusText = this.extensionStatusService.message || l10n.t('Copilot has encountered an error');
 				statusIcon = Icon.NotConnected;
 				break;
 		}
-		return this.newCommandItem(`${statusIcon} Status: ${statusText}`, CMDOpenLogsClient);
+		return this.newCommandItem(`${statusIcon} ${l10n.t('Status')}: ${statusText}`, CMDOpenLogsClient);
 	}
 
 	private newOpenLogsItem() {
-		return this.newCommandItem('Open Logs...', CMDOpenLogsClient);
+		return this.newCommandItem(l10n.t('Open Logs...'), CMDOpenLogsClient);
 	}
 
 	private collectDiagnosticsItems() {
 		if (isWeb) { return []; }
-		return [this.newCommandItem('Show Diagnostics...', CMDCollectDiagnosticsChat)];
+		return [this.newCommandItem(l10n.t('Show Diagnostics...'), CMDCollectDiagnosticsChat)];
 	}
 
 	private newKeyboardItem() {
-		return this.newCommandItem('$(keyboard) Edit Keyboard Shortcuts...', 'workbench.action.openGlobalKeybindings', [
+		return this.newCommandItem(l10n.t('$(keyboard) Edit Keyboard Shortcuts...'), 'workbench.action.openGlobalKeybindings', [
 			'copilot',
 		]);
 	}
 
 	private newSettingsItem() {
-		return this.newCommandItem('$(settings-gear) Edit Settings...', 'workbench.action.openSettings', [
+		return this.newCommandItem(l10n.t('$(settings-gear) Edit Settings...'), 'workbench.action.openSettings', [
 			'GitHub Copilot',
 		]);
 	}
-	/* 	private newPanelItem() {
+
 	private newPanelItem() {
-		return this.newCommandItem('Open Completions Panel...', CMDOpenPanel);
+		return this.newCommandItem(l10n.t('Open Completions Panel...'), CMDOpenPanelClient);
 	}
 
 	private newChangeModelItem() {
-		return this.newCommandItem('Change Completions Model...', CMDOpenModelPicker);
+		return this.newCommandItem(l10n.t('Change Completions Model...'), CMDOpenModelPickerClient);
 	}
-
-	private newForumItem() {
-		return this.newCommandItem('$(comments-view-icon) View Copilot Forum...', CMDSendFeedback);
-	} */
 
 	private newDocsItem() {
 		return this.newCommandItem(
-			'$(remote-explorer-documentation) View Copilot Documentation...',
+			l10n.t('$(remote-explorer-documentation) View Copilot Documentation...'),
 			CMDOpenDocumentationClient
 		);
 	}

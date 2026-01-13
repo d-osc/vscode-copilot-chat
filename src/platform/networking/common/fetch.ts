@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { EncryptedThinkingDelta, ThinkingData, ThinkingDelta } from '../../thinking/common/thinking';
+import { AnthropicMessagesTool, ContextManagementResponse } from './anthropic';
 import { Response } from './fetcherService';
 import { ChoiceLogProbs, FilterReason } from './openai';
 
@@ -28,14 +29,6 @@ export function getRequestId(response: Response, json?: any): RequestId {
 		serverExperiments: response.headers.get('X-Copilot-Experiment') || '',
 		deploymentId: response.headers.get('azureml-model-deployment') || '',
 	};
-}
-
-export function getProcessingTime(response: Response): number {
-	const reqIdStr = response.headers.get('openai-processing-ms');
-	if (reqIdStr) {
-		return parseInt(reqIdStr, 10);
-	}
-	return 0;
 }
 
 // Request methods
@@ -143,6 +136,8 @@ export interface IResponseDelta {
 	retryReason?: FilterReason | 'network_error';
 	/** Marker for the current response, which should be presented in `IMakeChatRequestOptions` on the next call */
 	statefulMarker?: string;
+	/** Context management information from Anthropic Messages API */
+	contextManagement?: ContextManagementResponse;
 }
 
 export const enum ResponsePartKind {
@@ -272,7 +267,7 @@ export interface OpenAiResponsesFunctionTool extends OpenAiFunctionDef {
 	type: 'function';
 }
 
-export function isOpenAiFunctionTool(tool: OpenAiResponsesFunctionTool | OpenAiFunctionTool): tool is OpenAiFunctionTool {
+export function isOpenAiFunctionTool(tool: OpenAiResponsesFunctionTool | OpenAiFunctionTool | AnthropicMessagesTool): tool is OpenAiFunctionTool {
 	return (tool as OpenAiFunctionTool).function !== undefined;
 }
 

@@ -5,12 +5,14 @@
 
 import { Raw } from '@vscode/prompt-tsx';
 import { Result } from '../../../util/common/result';
+import { ITracer } from '../../../util/common/tracing';
 import { assert, assertNever } from '../../../util/vs/base/common/assert';
 import { DeferredPromise } from '../../../util/vs/base/common/async';
 import { CancellationToken, CancellationTokenSource } from '../../../util/vs/base/common/cancellation';
 import { URI } from '../../../util/vs/base/common/uri';
 import { LineEdit, LineReplacement, SerializedLineEdit } from '../../../util/vs/editor/common/core/edits/lineEdit';
 import { StringEdit } from '../../../util/vs/editor/common/core/edits/stringEdit';
+import { Position } from '../../../util/vs/editor/common/core/position';
 import { OffsetRange } from '../../../util/vs/editor/common/core/ranges/offsetRange';
 import { StringText } from '../../../util/vs/editor/common/core/text/abstractText';
 import { ChatFetchResponseType, FetchResponse } from '../../chat/common/commonTypes';
@@ -23,20 +25,25 @@ import { DebugRecorderBookmark } from './debugRecorderBookmark';
 import { InlineEditRequestLogContext } from './inlineEditLogContext';
 import { stringifyChatMessages } from './utils/stringifyChatMessages';
 import { IXtabHistoryEntry } from './workspaceEditTracker/nesXtabHistoryTracker';
-import { Position } from '../../../util/vs/editor/common/core/position';
 
 export const enum ShowNextEditPreference {
 	Always = 'always',
 	AroundEdit = 'aroundEdit',
 }
 
-export type PushEdit = (edit: Result<{ edit: LineReplacement; window?: OffsetRange; targetDocument?: DocumentId; showLabel?: boolean }, NoNextEditReason>) => void;
+export type StreamedEdit = {
+	readonly edit: LineReplacement;
+	readonly window?: OffsetRange;
+	readonly targetDocument?: DocumentId;
+}
+
+export type PushEdit = (edit: Result<StreamedEdit, NoNextEditReason>) => void;
 
 export interface IStatelessNextEditProvider {
 	readonly ID: string;
 	readonly dependsOnSelection?: boolean;
 	readonly showNextEditPreference?: ShowNextEditPreference;
-	provideNextEdit(request: StatelessNextEditRequest, pushEdit: PushEdit, logContext: InlineEditRequestLogContext, cancellationToken: CancellationToken): Promise<StatelessNextEditResult>;
+	provideNextEdit(request: StatelessNextEditRequest, pushEdit: PushEdit, tracer: ITracer, logContext: InlineEditRequestLogContext, cancellationToken: CancellationToken): Promise<StatelessNextEditResult>;
 	handleAcceptance?(): void;
 	handleRejection?(): void;
 }
@@ -184,46 +191,84 @@ export enum FilteredOutReason {
 }
 
 export namespace NoNextEditReason {
-	export class ActiveDocumentHasNoEdits {
-		public readonly kind = 'activeDocumentHasNoEdits';
+	abstract class NoNextEditReason {
+		abstract toString(): string;
 	}
-	export class NoSuggestions {
+	export class ActiveDocumentHasNoEdits extends NoNextEditReason {
+		public readonly kind = 'activeDocumentHasNoEdits';
+
+		toString(): string {
+			return this.kind;
+		}
+	}
+	export class NoSuggestions extends NoNextEditReason {
 		public readonly kind = 'noSuggestions';
+
 		constructor(
 			public readonly documentBeforeEdits: StringText,
 			public readonly window: OffsetRange | undefined,
 			public readonly nextCursorPosition?: Position | undefined,
 		) {
+			super();
+		}
+
+		toString(): string {
+			return this.kind;
 		}
 	}
-	export class GotCancelled {
+	export class GotCancelled extends NoNextEditReason {
 		public readonly kind = 'gotCancelled';
-		constructor(public readonly message: 'afterDebounce' | 'afterGettingEndpoint' | 'afterLanguageContextAwait' | 'afterPromptConstruction' | 'afterFetchCall' | 'duringStreaming' | 'afterResponse' | 'afterFailedRebase' | 'beforeExecutingNewRequest') {
+		constructor(public readonly message: 'afterDebounce' | 'afterGettingEndpoint' | 'afterLanguageContextAwait' | 'afterPromptConstruction' | 'afterFetchCall' | 'duringStreaming' | 'afterResponse' | 'afterFailedRebase' | 'beforeExecutingNewRequest' | 'afterArtificialDelay') {
+			super();
+		}
+
+		toString(): string {
+			return `${this.kind}:${this.message}`;
 		}
 	}
-	export class FetchFailure {
+	export class FetchFailure extends NoNextEditReason {
 		public readonly kind = 'fetchFailure';
 		constructor(public readonly error: Error) {
+			super();
+		}
+		toString(): string {
+			return `${this.kind}:${this.error.message}`;
 		}
 	}
-	export class FilteredOut {
+	export class FilteredOut extends NoNextEditReason {
 		public readonly kind = 'filteredOut';
 		constructor(public readonly message: FilteredOutReason | string) {
+			super();
+		}
+		toString(): string {
+			return `${this.kind}:${this.message}`;
 		}
 	}
-	export class PromptTooLarge {
+	export class PromptTooLarge extends NoNextEditReason {
 		public readonly kind = 'promptTooLarge';
 		constructor(public readonly message: 'editWindow' | 'currentFile' | 'final') {
+			super();
+		}
+		toString(): string {
+			return `${this.kind}:${this.message}`;
 		}
 	}
-	export class Uncategorized {
+	export class Uncategorized extends NoNextEditReason {
 		public readonly kind = 'uncategorized';
 		constructor(public readonly error: Error) {
+			super();
+		}
+		toString(): string {
+			return `${this.kind}:${this.error.message}`;
 		}
 	}
-	export class Unexpected {
+	export class Unexpected extends NoNextEditReason {
 		public readonly kind = 'unexpected';
 		constructor(public readonly error: Error) {
+			super();
+		}
+		toString(): string {
+			return `${this.kind}:${this.error.message}`;
 		}
 	}
 }
@@ -304,10 +349,11 @@ export interface IStatelessNextEditTelemetry {
 	readonly noNextEditReasonMessage: string | undefined;
 
 	/* next cursor line info */
-
-	readonly nextCursorLineError: string | undefined;
-	/** nextCursorLineNumber - currentCursorLineNumber */
-	readonly nextCursorLineDistance: number | undefined;
+	readonly nextCursorPrediction: {
+		nextCursorLineError: string | undefined;
+		/** nextCursorLineNumber - currentCursorLineNumber */
+		nextCursorLineDistance: number | undefined;
+	};
 }
 
 export type FetchResultWithStats = {
@@ -376,8 +422,7 @@ export class StatelessNextEditTelemetryBuilder {
 			response: this._response,
 			nEditsSuggested: this._nEditsSuggested,
 			nextEditLogprob: this._nextEditLogProb,
-			nextCursorLineError: this._nextCursorLineError,
-			nextCursorLineDistance: this._nextCursorLineDistance,
+			nextCursorPrediction: this._nextCursorPrediction,
 			lineDistanceToMostRecentEdit: this._lineDistanceToMostRecentEdit,
 		};
 	}
@@ -482,18 +527,21 @@ export class StatelessNextEditTelemetryBuilder {
 		return this;
 	}
 
-	private _nextCursorLineError: string | undefined;
+	private _nextCursorPrediction: IStatelessNextEditTelemetry['nextCursorPrediction'] = {
+		nextCursorLineError: undefined,
+		nextCursorLineDistance: undefined
+	};
+
 	public setNextCursorLineError(error: string): this {
-		this._nextCursorLineError = error;
+		this._nextCursorPrediction.nextCursorLineError = error;
 		return this;
 	}
 
-	private _nextCursorLineDistance: number | undefined;
 	/**
 	 * nextCursorLineNumber - currentCursorLineNumber
 	 */
 	public setNextCursorLineDistance(distance: number): this {
-		this._nextCursorLineDistance = distance;
+		this._nextCursorPrediction.nextCursorLineDistance = distance;
 		return this;
 	}
 }

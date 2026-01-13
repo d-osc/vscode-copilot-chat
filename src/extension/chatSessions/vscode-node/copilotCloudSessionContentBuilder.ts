@@ -9,7 +9,6 @@ import { ChatRequestTurn, ChatRequestTurn2, ChatResponseMarkdownPart, ChatRespon
 import { IGitService } from '../../../platform/git/common/gitService';
 import { PullRequestSearchItem, SessionInfo } from '../../../platform/github/common/githubAPI';
 import { getAuthorDisplayName, toOpenPullRequestWebviewUri } from '../vscode/copilotCodingAgentUtils';
-import { IPullRequestFileChangesService } from './pullRequestFileChangesService';
 
 export interface SessionResponseLogChunk {
 	choices: Array<{
@@ -99,8 +98,7 @@ export interface ParsedToolCallDetails {
 export class ChatSessionContentBuilder {
 	constructor(
 		private type: string,
-		@IGitService private readonly _gitService: IGitService,
-		@IPullRequestFileChangesService private readonly _prFileChangesService: IPullRequestFileChangesService,
+		@IGitService private readonly _gitService: IGitService
 	) {
 	}
 
@@ -109,6 +107,7 @@ export class ChatSessionContentBuilder {
 		sessions: SessionInfo[],
 		pullRequest: PullRequestSearchItem,
 		getLogsForSession: (id: string) => Promise<string>,
+		initialReferences: Promise<vscode.ChatPromptReference[]>,
 	): Promise<Array<ChatRequestTurn | ChatResponseTurn2>> {
 		const history: Array<ChatRequestTurn | ChatResponseTurn2> = [];
 
@@ -119,18 +118,20 @@ export class ChatSessionContentBuilder {
 
 				const turns: Array<ChatRequestTurn | ChatResponseTurn2> = [];
 
-				// Create request turn
+				// Create request turn with references for the first session
+				const references = sessionIndex === 0 ? Array.from(await initialReferences) : [];
 				turns.push(new ChatRequestTurn2(
 					problemStatement || session.name,
 					undefined, // command
-					[], // references
+					references, // references
 					this.type,
 					[], // toolReferences
-					[]
+					[],
+					undefined
 				));
 
 				// Create the PR card right after problem statement for first session
-				if (sessionIndex === 0 && pullRequest.author) {
+				if (sessionIndex === 0 && pullRequest.author && vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
 					const uri = await toOpenPullRequestWebviewUri({ owner: pullRequest.repository.owner.login, repo: pullRequest.repository.name, pullRequestNumber: pullRequest.number });
 					const plaintextBody = pullRequest.body;
 
@@ -191,13 +192,6 @@ export class ChatSessionContentBuilder {
 				}
 			}
 
-			if (session.state === 'completed' || session.state === 'failed' /** session can fail with proposed changes */) {
-				const multiDiffPart = await this._prFileChangesService.getFileChangesMultiDiffPart(pullRequest);
-				if (multiDiffPart) {
-					responseParts.push(multiDiffPart);
-				}
-			}
-
 			if (responseParts.length > 0) {
 				const responseResult: ChatResult = {};
 				return new ChatResponseTurn2(responseParts, responseResult, this.type);
@@ -245,6 +239,9 @@ export class ChatSessionContentBuilder {
 					const toolPart = this.createToolInvocationPart(pullRequest, toolCall, args.name || delta.content);
 					if (toolPart) {
 						responseParts.push(toolPart);
+						if (toolPart instanceof ChatResponseThinkingProgressPart) {
+							responseParts.push(new ChatResponseThinkingProgressPart('', '', { vscodeReasoningDone: true }));
+						}
 					}
 				}
 				// Skip if content is empty (running state)
@@ -267,6 +264,9 @@ export class ChatSessionContentBuilder {
 						const toolPart = this.createToolInvocationPart(pullRequest, toolCall, delta.content || '');
 						if (toolPart) {
 							responseParts.push(toolPart);
+							if (toolPart instanceof ChatResponseThinkingProgressPart) {
+								responseParts.push(new ChatResponseThinkingProgressPart('', '', { vscodeReasoningDone: true }));
+							}
 						}
 					}
 
@@ -277,6 +277,17 @@ export class ChatSessionContentBuilder {
 						toolPart.invocationMessage = cleaned;
 						toolPart.isError = true;
 						responseParts.push(toolPart);
+					}
+				} else {
+					const trimmedContent = currentResponseContent.trim();
+					if (trimmedContent) {
+						// TODO@rebornix @osortega validate if this is the only finish_reason for session end.
+						if (choice.finish_reason === 'stop') {
+							responseParts.push(new ChatResponseMarkdownPart(trimmedContent));
+						} else {
+							responseParts.push(new ChatResponseThinkingProgressPart(trimmedContent, '', { vscodeReasoningDone: true }));
+						}
+						currentResponseContent = '';
 					}
 				}
 			}
@@ -449,7 +460,7 @@ export class ChatSessionContentBuilder {
 			};
 		};
 
-		const buildEditDetails = (filePath: string | undefined, command: string, parsedRange: { start: number; end: number } | undefined, opts?: { defaultName?: string }): ParsedToolCallDetails => {
+		const buildEditDetails = (filePath: string | undefined, command: string = 'edit', parsedRange: { start: number; end: number } | undefined, opts?: { defaultName?: string }): ParsedToolCallDetails => {
 			const fileLabel = filePath && this.toFileLabel(filePath);
 			const rangeSuffix = parsedRange ? `, lines ${parsedRange.start} to ${parsedRange.end}` : '';
 			let invocationMessage: string;
@@ -567,7 +578,7 @@ export class ChatSessionContentBuilder {
 						toolSpecificData: { command: 'view', filePath: fp, fileLabel: fl, viewRange: plainRange }
 					};
 				}
-				return buildEditDetails(args.path, args.command || 'edit', this.parseRange(args.view_range));
+				return buildEditDetails(args.path, args.command, this.parseRange(args.view_range));
 			}
 			case 'str_replace':
 				return buildStrReplaceDetails(args.path);
@@ -590,6 +601,8 @@ export class ChatSessionContentBuilder {
 				return { toolName: 'read_bash', invocationMessage: 'Read logs from Bash session' };
 			case 'stop_bash':
 				return { toolName: 'stop_bash', invocationMessage: 'Stop Bash session' };
+			case 'edit':
+				return buildEditDetails(args.path, args.command, undefined);
 			default:
 				return { toolName: name || 'unknown', invocationMessage: content || name || 'unknown' };
 		}

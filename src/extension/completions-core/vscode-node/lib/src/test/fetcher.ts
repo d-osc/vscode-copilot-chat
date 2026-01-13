@@ -3,9 +3,9 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { FetchOptions, Fetcher, IAbortController, IHeaders, Response } from '../networking';
-import { CopilotNamedAnnotationList } from '../openai/stream';
 import { Readable } from 'stream';
+import { FetchOptions, IAbortController, ICompletionsFetcherService, IHeaders, Response } from '../networking';
+import { CopilotNamedAnnotationList } from '../openai/stream';
 
 type HeadersParameter = { [key: string]: string };
 
@@ -21,7 +21,8 @@ export function createFakeResponse(statusCode: number, response?: string, header
 		fakeHeaders,
 		() => Promise.resolve(response ?? ''),
 		() => Promise.resolve(response ? JSON.parse(response) : {}),
-		() => Promise.resolve(null)
+		() => Promise.resolve(null),
+		'test-stub'
 	);
 }
 
@@ -42,7 +43,8 @@ export function createFakeStreamResponse(body: string): Response {
 		new FakeHeaders(),
 		() => Promise.resolve(body),
 		() => Promise.resolve(JSON.parse(body.replace(/^data: /gm, '').replace(/\n\[DONE\]\n$/, ''))),
-		() => Promise.resolve(toStream(body))
+		() => Promise.resolve(toStream(body)),
+		'test-stub'
 	);
 }
 
@@ -97,8 +99,13 @@ export function fakeCodeReference(
 	};
 }
 
-export abstract class FakeFetcher extends Fetcher {
-	override readonly name: string = 'FakeFetcher';
+export abstract class FakeFetcher implements ICompletionsFetcherService {
+	declare _serviceBrand: undefined;
+
+	abstract fetch(url: string, options: FetchOptions): Promise<Response>;
+	getImplementation(): ICompletionsFetcherService | Promise<ICompletionsFetcherService> {
+		return this;
+	}
 	disconnectAll(): Promise<unknown> {
 		throw new Error('Method not implemented.');
 	}

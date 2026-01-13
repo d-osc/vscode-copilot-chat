@@ -64,7 +64,7 @@ export class ChatVariables extends PromptElement<ChatVariablesProps, void> {
 	}
 
 	override async render(state: void, sizing: PromptSizing): Promise<PromptPiece<any, any> | undefined> {
-		const elements = await renderChatVariables(this.props.chatVariables, this.fileSystemService, this.props.includeFilepath, this.props.omitReferences, this.props.isAgent, this.props.useFixCookbook);
+		const elements = await renderChatVariables(this.props.chatVariables, this.fileSystemService, this.props.includeFilepath, true, this.props.omitReferences, this.props.isAgent, this.props.useFixCookbook);
 		if (elements.length === 0) {
 			return undefined;
 		}
@@ -89,8 +89,18 @@ export interface QueryProps extends BasePromptElementProps {
 
 export class UserQuery extends PromptElement<QueryProps, void> {
 	override render(state: void, sizing: PromptSizing): PromptPiece<any, any> | undefined {
-		const rewrittenMessage = this.props.chatVariables.substituteVariablesWithReferences(this.props.query);
-		return (<>{rewrittenMessage}</>);
+		const promptFiles = [];
+		for (const v of this.props.chatVariables) {
+			if (isPromptFile(v)) {
+				promptFiles.push(<PromptFile variable={v} omitReferences={false} />);
+			}
+		}
+		return (
+			<>
+				{...promptFiles}
+				{this.props.query}
+			</>
+		);
 	}
 }
 
@@ -115,7 +125,7 @@ export class ChatVariablesAndQuery extends PromptElement<ChatVariablesAndQueryPr
 
 	override async render(state: void, sizing: PromptSizing): Promise<PromptPiece<any, any> | undefined> {
 		const chatVariables = this.props.maintainOrder ? this.props.chatVariables : this.props.chatVariables.reverse();
-		const elements = await renderChatVariables(chatVariables, this.fileSystemService, this.props.includeFilepath, this.props.omitReferences, undefined);
+		const elements = await renderChatVariables(chatVariables, this.fileSystemService, this.props.includeFilepath, true, this.props.omitReferences, undefined);
 
 		if (this.props.embeddedInsideUserMessage ?? embeddedInsideUserMessageDefault) {
 			if (!elements.length) {
@@ -147,7 +157,7 @@ function asUserMessage(element: PromptElement, priority: number | undefined): Us
 }
 
 
-export async function renderChatVariables(chatVariables: ChatVariablesCollection, fileSystemService: IFileSystemService, includeFilepathInCodeBlocks = true, omitReferences?: boolean, isAgent?: boolean, useFixCookbook?: boolean): Promise<PromptElement[]> {
+export async function renderChatVariables(chatVariables: ChatVariablesCollection, fileSystemService: IFileSystemService, includeFilepathInCodeBlocks = true, alwaysIncludeSummary = true, omitReferences?: boolean, isAgent?: boolean, useFixCookbook?: boolean): Promise<PromptElement[]> {
 	const elements = [];
 	const filePathMode = (isAgent && includeFilepathInCodeBlocks)
 		? FilePathMode.AsAttribute
@@ -156,11 +166,7 @@ export async function renderChatVariables(chatVariables: ChatVariablesCollection
 			: FilePathMode.None;
 	for (const variable of chatVariables) {
 		const { uniqueName: variableName, value: variableValue, reference } = variable;
-		if (isPromptInstruction(variable)) { // prompt instructions are handled in the `CustomInstructions` element
-			continue;
-		}
-		if (isPromptFile(variable)) {
-			elements.push(<PromptFile variable={variable} omitReferences={omitReferences} filePathMode={filePathMode} />);
+		if (isPromptInstruction(variable) || isPromptFile(variable)) { // prompt instructions are handled in the `CustomInstructions` element, prompt file as part of the UserQuery
 			continue;
 		}
 
@@ -178,7 +184,7 @@ export async function renderChatVariables(chatVariables: ChatVariablesCollection
 				elements.push(<FolderVariable variableName={variableName} folderUri={uri} omitReferences={omitReferences} description={reference.modelDescription} />);
 			} else {
 				const file = <FileVariable
-					alwaysIncludeSummary={true}
+					alwaysIncludeSummary={alwaysIncludeSummary}
 					filePathMode={filePathMode}
 					variableName={variableName}
 					variableValue={variableValue}
@@ -255,7 +261,7 @@ class DiagnosticVariable extends PromptElement<IDiagnosticVariableProps> {
 					}
 
 					return <>
-						<Tag name="error" attrs={{ path: this.promptPathRepresentationService.getFilePath(uri), line: range.start.line + 1, code: getDiagnosticCode(d), severity: diagnosticSeverityMap[d.severity] }}>
+						<Tag name='error' attrs={{ path: this.promptPathRepresentationService.getFilePath(uri), line: range.start.line + 1, code: getDiagnosticCode(d), severity: diagnosticSeverityMap[d.severity] }}>
 							{d.message}
 						</Tag>
 						{cookbook && <DiagnosticSuggestedFix cookbook={cookbook} />}

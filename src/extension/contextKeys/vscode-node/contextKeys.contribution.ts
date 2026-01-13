@@ -3,13 +3,12 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 import { commands, extensions, window } from 'vscode';
-import { IAuthenticationService } from '../../../platform/authentication/common/authentication';
+import { IAuthenticationService, MinimalModeError } from '../../../platform/authentication/common/authentication';
 import { ChatDisabledError, ContactSupportError, EnterpriseManagedError, NotSignedUpError, SubscriptionExpiredError } from '../../../platform/authentication/vscode-node/copilotTokenManager';
 import { SESSION_LOGIN_MESSAGE } from '../../../platform/authentication/vscode-node/session';
 import { ConfigKey, IConfigurationService } from '../../../platform/configuration/common/configurationService';
 import { IEnvService } from '../../../platform/env/common/envService';
 import { ILogService } from '../../../platform/log/common/logService';
-import { IFetcherService } from '../../../platform/networking/common/fetcherService';
 import { ITelemetryService } from '../../../platform/telemetry/common/telemetry';
 import { TelemetryData } from '../../../platform/telemetry/common/telemetryData';
 import { Disposable } from '../../../util/vs/base/common/lifecycle';
@@ -35,6 +34,8 @@ const previewFeaturesDisabledContextKey = 'github.copilot.previewFeaturesDisable
 
 const debugContextKey = 'github.copilot.chat.debug';
 
+const missingPermissiveSessionContextKey = 'github.copilot.auth.missingPermissiveSession';
+
 export const prExtensionInstalledContextKey = 'github.copilot.prExtensionInstalled';
 
 export class ContextKeysContribution extends Disposable {
@@ -46,7 +47,6 @@ export class ContextKeysContribution extends Disposable {
 	constructor(
 		@IAuthenticationService private readonly _authenticationService: IAuthenticationService,
 		@ITelemetryService private readonly _telemetryService: ITelemetryService,
-		@IFetcherService private readonly _fetcherService: IFetcherService,
 		@ILogService private readonly _logService: ILogService,
 		@IConfigurationService private readonly _configService: IConfigurationService,
 		@IEnvService private readonly _envService: IEnvService
@@ -54,6 +54,7 @@ export class ContextKeysContribution extends Disposable {
 		super();
 
 		void this._inspectContext().catch(console.error);
+		void this._updatePermissiveSessionContext().catch(console.error);
 		this._register(_authenticationService.onDidAuthenticationChange(async () => await this._onAuthenticationChange()));
 		this._register(commands.registerCommand('github.copilot.refreshToken', async () => await this._inspectContext()));
 		this._register(commands.registerCommand('github.copilot.debug.showChatLogView', async () => {
@@ -68,7 +69,7 @@ export class ContextKeysContribution extends Disposable {
 		this._updateDebugContext();
 		this._updatePrExtensionInstalledContext();
 
-		const debugReportFeedback = this._configService.getConfigObservable(ConfigKey.Internal.DebugReportFeedback);
+		const debugReportFeedback = this._configService.getConfigObservable(ConfigKey.TeamInternal.DebugReportFeedback);
 		this._register(autorun(reader => {
 			commands.executeCommand('setContext', debugReportFeedbackContextKey, debugReportFeedback.read(reader));
 		}));
@@ -139,7 +140,7 @@ export class ContextKeysContribution extends Disposable {
 			key = welcomeViewContextKeys.ContactSupport;
 		} else if (error instanceof ChatDisabledError) {
 			key = welcomeViewContextKeys.CopilotChatDisabled;
-		} else if (this._fetcherService.isFetcherError(error)) {
+		} else if (error) {
 			key = welcomeViewContextKeys.Offline;
 			this._scheduleOfflineCheck();
 		}
@@ -154,6 +155,8 @@ export class ContextKeysContribution extends Disposable {
 				commands.executeCommand('setContext', contextKey, false);
 			}
 		}
+
+		await this._updatePermissiveSessionContext();
 	}
 
 	private async _updateQuotaExceededContext() {
@@ -203,5 +206,23 @@ export class ContextKeysContribution extends Disposable {
 		this._updateQuotaExceededContext();
 		this._updatePreviewFeaturesDisabledContext();
 		this._updateShowLogViewContext();
+		this._updatePermissiveSessionContext();
+	}
+
+	private async _updatePermissiveSessionContext() {
+		let hasPermissiveSession = false;
+		let missingPermissiveSession = false;
+		if (!this._authenticationService.isMinimalMode) {
+			try {
+				hasPermissiveSession = !!(await this._authenticationService.getGitHubSession('permissive', { silent: true }));
+			} catch (error) {
+				if (!(error instanceof MinimalModeError)) {
+					this._logService.trace(`[context keys] Failed to resolve permissive session: ${error instanceof Error ? error.message : String(error)}`);
+					hasPermissiveSession = !!this._authenticationService.permissiveGitHubSession;
+				}
+			}
+			missingPermissiveSession = !hasPermissiveSession;
+		}
+		commands.executeCommand('setContext', missingPermissiveSessionContextKey, missingPermissiveSession);
 	}
 }

@@ -35,7 +35,7 @@ import { IIntentService } from '../../intents/node/intentService';
 import { UnknownIntent } from '../../intents/node/unknownIntent';
 import { ContributedToolName } from '../../tools/common/toolNames';
 import { ChatVariablesCollection } from '../common/chatVariablesCollection';
-import { Conversation, getGlobalContextCacheKey, GlobalContextMessageMetadata, ICopilotChatResult, ICopilotChatResultIn, normalizeSummariesOnRounds, RenderedUserMessageMetadata, Turn, TurnStatus } from '../common/conversation';
+import { AnthropicTokenUsageMetadata, Conversation, getGlobalContextCacheKey, GlobalContextMessageMetadata, ICopilotChatResult, ICopilotChatResultIn, normalizeSummariesOnRounds, RenderedUserMessageMetadata, Turn, TurnStatus } from '../common/conversation';
 import { InternalToolReference } from '../common/intents';
 import { ChatTelemetryBuilder } from './chatParticipantTelemetry';
 import { DefaultIntentRequestHandler } from './defaultIntentRequestHandler';
@@ -381,19 +381,20 @@ function getResponseIdFromVSCodeChatHistoryTurn(turn: ChatRequestTurn | ChatResp
  */
 function createTurnFromVSCodeChatHistoryTurns(
 	accessor: ServicesAccessor,
-	chatRequestTurn: ChatRequestTurn2,
+	chatRequestTurn: ChatRequestTurn,
 	chatResponseTurn: ChatResponseTurn
 ): Turn {
 	const commandService = accessor.get(ICommandService);
 	const workspaceService = accessor.get(IWorkspaceService);
 	const instaService = accessor.get(IInstantiationService);
 
+	const chatRequestAsTurn2 = chatRequestTurn as ChatRequestTurn2;
 	const currentTurn = new Turn(
 		undefined,
 		{ message: chatRequestTurn.prompt, type: 'user' },
 		new ChatVariablesCollection(chatRequestTurn.references),
 		chatRequestTurn.toolReferences.map(InternalToolReference.from),
-		chatRequestTurn.editedFileEvents
+		chatRequestAsTurn2.editedFileEvents
 	);
 
 	// Take just the content messages
@@ -436,6 +437,9 @@ function createTurnFromVSCodeChatHistoryTurns(
 	if (turnMetadata?.renderedUserMessage) {
 		currentTurn.setMetadata(new RenderedUserMessageMetadata(turnMetadata.renderedUserMessage));
 	}
+	if (turnMetadata?.promptTokens && turnMetadata?.outputTokens) {
+		currentTurn.setMetadata(new AnthropicTokenUsageMetadata(turnMetadata.promptTokens, turnMetadata.outputTokens));
+	}
 
 	return currentTurn;
 }
@@ -446,10 +450,12 @@ function anchorPartToMarkdown(workspaceService: IWorkspaceService, anchor: ChatR
 
 	if (URI.isUri(anchor.value)) {
 		path = getWorkspaceFileDisplayPath(workspaceService, anchor.value);
-		text = `\`${path}\``;
+		const label = anchor.title ?? path;
+		text = `\`${label}\``;
 	} else if (isLocation(anchor.value)) {
 		path = getWorkspaceFileDisplayPath(workspaceService, anchor.value.uri);
-		text = `\`${path}\``;
+		const label = anchor.title ?? `${path}#L${anchor.value.range.start.line + 1}${anchor.value.range.start.line === anchor.value.range.end.line ? '' : `-${anchor.value.range.end.line + 1}`}`;
+		text = `\`${label}\``;
 	} else if (isSymbolInformation(anchor.value)) {
 		path = getWorkspaceFileDisplayPath(workspaceService, anchor.value.location.uri);
 		text = `\`${anchor.value.name}\``;
